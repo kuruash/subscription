@@ -1,0 +1,44 @@
+# docker-compose.yml
+# Spins up Postgres + Redis locally so the Go app has something to talk to.
+# Redis is provisioned now but unused until Phase 2 — starting it early means
+# the connection string is stable and you won't have to reshape config later.
+#
+# Usage:
+#   docker compose up -d     # start in background
+#   docker compose down      # stop (data persists)
+#   docker compose down -v   # stop AND wipe the postgres volume
+
+services:
+  postgres:
+    image: postgres:16-alpine        # alpine = tiny Linux base, faster pulls
+    container_name: subs_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: subs
+      POSTGRES_PASSWORD: subs
+      POSTGRES_DB: subscriptions
+    ports:
+      - "5433:5432"                  # host:container — Go connects via localhost:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data          # named volume: data survives `down`
+      - ./migrations:/docker-entrypoint-initdb.d        # *.sql files here run on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U subs -d subscriptions"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: subs_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:                     # declares the named volume referenced above

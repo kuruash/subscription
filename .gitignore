@@ -1,0 +1,51 @@
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Go build output ---
+# Binaries produced by `go build` at the repo root or in cmd/*/
+# (bare name matches an executable with no extension on macOS/Linux)
+/api
+/worker
+/cmd/api/api
+/cmd/worker/worker
+*.exe
+*.test
+*.out
+
+# Coverage / profiling
+coverage.out
+*.prof
+
+# Go workspace files (if you ever use `go work`)
+go.work
+go.work.sum
+
+# Vendor directory — only if you commit deps (we don't; go.sum is enough)
+# /vendor/
+
+# --- Env / secrets ---
+# Anything with real credentials must never be committed.
+.env
+.env.*
+!.env.example        # keep a template if you make one
+*.pem
+*.key
+
+# --- Docker / local data ---
+# Named volumes live inside Docker, not this folder, so nothing to ignore
+# there. But if you ever bind-mount ./data or ./pgdata:
+/data/
+/pgdata/
+
+# --- Logs ---
+*.log
+logs/
