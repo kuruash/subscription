@@ -30,7 +30,10 @@ type SubscriptionRepository interface {
 	Create(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error)
 	GetByID(ctx context.Context, id int) (*models.Subscription, error)
 	ListByUser(ctx context.Context, userID int) ([]models.Subscription, error)
-	Cancel(ctx context.Context, id int) error
+	// Cancel returns the affected subscription's user_id so callers can
+	// invalidate that user's cache. Returns ErrNotFound if the row doesn't
+	// exist or isn't active.
+	Cancel(ctx context.Context, id int) (userID int, err error)
 	Renew(ctx context.Context, id int) (*models.Subscription, error)
 }
 
@@ -152,21 +155,24 @@ func (r *postgresRepo) ListByUser(ctx context.Context, userID int) ([]models.Sub
 	return out, rows.Err()
 }
 
-func (r *postgresRepo) Cancel(ctx context.Context, id int) error {
+func (r *postgresRepo) Cancel(ctx context.Context, id int) (int, error) {
 	// Soft delete: flip status, don't actually remove the row. Preserves
 	// history for the transactions FK and for support/analytics.
-	res, err := r.db.ExecContext(ctx, `
+	// RETURNING user_id lets the caller know whose cache to invalidate
+	// without a second round trip.
+	var userID int
+	err := r.db.QueryRowContext(ctx, `
 		UPDATE subscriptions SET status = $1
 		WHERE id = $2 AND status = $3
-	`, models.StatusCancelled, id, models.StatusActive)
+		RETURNING user_id
+	`, models.StatusCancelled, id, models.StatusActive).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound // either no such id, or it wasn't active
+	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound // either no such id, or it wasn't active
-	}
-	return nil
+	return userID, nil
 }
 
 func (r *postgresRepo) Renew(ctx context.Context, id int) (*models.Subscription, error) {

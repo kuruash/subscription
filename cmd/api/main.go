@@ -21,6 +21,7 @@ import (
 	_ "github.com/lib/pq" // blank import: registers the "postgres" driver
 	                     // with database/sql. We never call pq directly here,
 	                     // but without this line sql.Open("postgres", ...) fails.
+	"github.com/redis/go-redis/v9"
 
 	"subscription-service/internal/handlers"
 	"subscription-service/internal/repository"
@@ -49,10 +50,23 @@ func main() {
 		log.Fatalf("ping db: %v", err)
 	}
 
+	// --- Redis ---
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379" // matches docker-compose.yml
+	}
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		// Non-fatal: the service is designed to degrade to DB-only if Redis
+		// is unreachable. We log loudly and keep going.
+		log.Printf("WARN: redis ping failed (%v) — will run without cache", err)
+	}
+
 	// Dependency injection, done by hand. Each layer is constructed with
 	// the one below it. No framework, no container — just function calls.
 	repo := repository.NewPostgresRepo(db)
-	svc := services.NewSubscriptionService(repo)
+	svc := services.NewSubscriptionService(repo, rdb)
 	h := handlers.NewSubscriptionHandler(svc)
 
 	r := gin.Default()
