@@ -7,10 +7,11 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 3 complete** — core CRUD API backed by Postgres, with a
-Redis cache-aside layer on the list endpoint, and a background worker
-that expires overdue subscriptions on a timer. Notification queue, auth,
-and payments come in later phases.
+**Status: Phase 4 complete** — core CRUD API backed by Postgres, with a
+Redis cache-aside layer on the list endpoint, a background worker that
+expires overdue subscriptions on a timer, and an in-process notification
+queue that fires "subscribed" and "expired" events to a stub consumer.
+Auth and payments come in later phases.
 
 ---
 
@@ -33,6 +34,7 @@ subscription-service/
 │   ├── services/             # Business logic — validation, orchestration, cache coord.
 │   ├── repository/           # SQL layer — the only place SQL lives
 │   ├── cache/                # Redis key format helpers (shared by API + worker)
+│   ├── notifications/        # In-process event queue + stub consumer
 │   └── models/               # Plain data structs shared across layers
 ├── migrations/
 │   └── 001_init.sql          # Schema, auto-applied on first Postgres boot
@@ -397,12 +399,123 @@ Terminal B for tick logs) or the DB row wasn't actually backdated
 
 ---
 
+## Phase 4: Notification Queue
+
+Producers (the service layer) publish `Event`s after a successful DB
+commit. A consumer goroutine reads them off a buffered Go channel and
+calls a stub `NotifyCreator` that logs a line per event. This is the
+same producer/consumer shape SQS will have — the swap later touches
+only `main.go`.
+
+### Event shape and paths that publish
+
+```go
+type Event struct {
+    SubscriptionID int
+    UserID         int
+    CreatorID      int
+    Type           EventType   // "subscribed" | "expired"
+}
+```
+
+- `POST /subscriptions` → publishes `subscribed` after commit (API process).
+- Worker sweep → publishes one `expired` per row it flipped (worker process).
+
+Both use the exact same `Publisher` interface; the service layer doesn't
+know or care whether the queue behind it is a Go channel or SQS.
+
+### Non-blocking Publish + dropped-event behavior
+
+Publish uses `select { case ch <- ev: default: log }` — a **non-blocking
+send**. If the buffer (default 128) is full, the event is dropped and a
+`DROPPED event` line is logged.
+
+Why non-blocking: publish is called inside an HTTP request handler.
+Blocking here would couple the API's response latency to the consumer's
+health — exactly the coupling the queue exists to prevent.
+
+What "dropped" costs: **only** the notification for that specific event.
+The DB commit already happened, so the subscription is real; the creator
+just doesn't get a notification for that one signup. This is a documented
+tradeoff of the same class as Phase 2's Redis DEL failure and Phase 3's
+worker-restart-loses-timing gap. Under normal load the buffer is never
+full — a `DROPPED` line is your signal to raise the buffer or move to SQS.
+
+### Durability gap (documented)
+
+Events live in an in-memory channel. **If the process crashes, any events
+still in the buffer are lost.** Same is true if a clean shutdown happens
+mid-drain: the consumer stops on `ctx.Done` and any remaining events log
+as "dropped in-flight."
+
+What changes when we swap to SQS:
+- `Publish` becomes an SQS `SendMessage`; the buffer disappears and
+  durability becomes the queue's problem, not our process's.
+- The consumer becomes an SQS long-poll loop with visibility timeouts
+  and explicit `DeleteMessage` on success. Failed handlers re-appear
+  after the visibility timeout and eventually go to a dead-letter queue.
+- Producers can live in different processes/hosts without needing a
+  shared in-memory channel. The current per-process queue collapses to
+  one shared queue.
+- The `Publisher` interface stays; only its constructor call in
+  `main.go` changes.
+
+### Consumer idempotency (deliberately not built yet)
+
+`NotifyCreator` currently just logs — being called twice for the same
+event is harmless (you see the log line twice). Once it becomes a real
+email send, duplicates would mean duplicate emails: annoying, not
+corrupting. The clean fix is a UUID stamped at Publish time plus
+consumer-side "have I seen this ID?" tracking. Deferred — not worth
+building against a log stub, and SQS FIFO queues have message dedupe
+built in that may handle it for free after the swap.
+
+### How to verify
+
+Terminal A: `go run ./cmd/api`
+Terminal B: shell.
+
+```bash
+curl -s -X POST localhost:8080/subscriptions \
+     -H 'content-type: application/json' \
+     -d '{"user_id":1,"creator_id":1,"plan":"monthly"}'
+```
+
+In Terminal A you should see, in this order and effectively instantly
+(< 1ms between the two under normal load):
+
+```
+[GIN]  ... | 201 |  ... POST     /subscriptions
+notifications: would notify creator=1 about subscribed of subscription=<id> (user=1)
+```
+
+Why "effectively instantly": the consumer goroutine is already parked on
+`<-ch` waiting; the moment Publish sends onto the channel, the runtime
+schedules the consumer and it prints its line. Under heavy load or if
+`NotifyCreator` grew slow, you could see the second line lag behind by
+the amount of consumer backlog — but the HTTP `201` still returns
+immediately because Publish never waits.
+
+To watch the expired path, follow the Phase 3 test recipe (backdate an
+`expires_at`, wait for the worker tick). In the **worker's** terminal
+you'll see, right after `sweep OK ... expired`:
+
+```
+notifications: would notify creator=1 about expired of subscription=<id> (user=1)
+```
+
+To force the dropped-event path (mostly curiosity): lower the buffer to
+1 in `cmd/api/main.go` and hammer the endpoint with a loop; you'll see
+`DROPPED event` lines when the consumer can't keep up.
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
 
 - ~~Phase 2 — Redis cache-aside on the list endpoint + write-invalidation~~ ✅
 - ~~Phase 3 — Background worker that expires overdue subscriptions on a ticker~~ ✅
-- Phase 4 — In-process notification queue (channel), later swapped for SQS
+- ~~Phase 4 — In-process notification queue (channel), later swapped for SQS~~ ✅
 - Phase 5 — JWT auth middleware
 - Phase 6 — Stripe sandbox, webhooks, rate limiting, metrics, tests, CI/CD

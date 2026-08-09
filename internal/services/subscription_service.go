@@ -26,6 +26,7 @@ import (
 
 	"subscription-service/internal/cache"
 	"subscription-service/internal/models"
+	"subscription-service/internal/notifications"
 	"subscription-service/internal/repository"
 )
 
@@ -49,12 +50,17 @@ const (
 )
 
 type SubscriptionService struct {
-	repo repository.SubscriptionRepository
-	rdb  *redis.Client
+	repo      repository.SubscriptionRepository
+	rdb       *redis.Client
+	publisher notifications.Publisher
 }
 
-func NewSubscriptionService(repo repository.SubscriptionRepository, rdb *redis.Client) *SubscriptionService {
-	return &SubscriptionService{repo: repo, rdb: rdb}
+func NewSubscriptionService(
+	repo repository.SubscriptionRepository,
+	rdb *redis.Client,
+	publisher notifications.Publisher,
+) *SubscriptionService {
+	return &SubscriptionService{repo: repo, rdb: rdb, publisher: publisher}
 }
 
 type CreateInput struct {
@@ -88,6 +94,14 @@ func (s *SubscriptionService) Create(ctx context.Context, in CreateInput) (*mode
 		return nil, err
 	}
 	s.invalidateUserList(ctx, created.UserID)
+	// Publish AFTER the commit. Publishing before would let us emit a
+	// "subscribed" event for a row that ended up not existing.
+	s.publisher.Publish(notifications.Event{
+		SubscriptionID: created.ID,
+		UserID:         created.UserID,
+		CreatorID:      created.CreatorID,
+		Type:           notifications.EventSubscribed,
+	})
 	return created, nil
 }
 
@@ -170,6 +184,14 @@ func (s *SubscriptionService) ExpireOverdue(ctx context.Context) ([]repository.E
 	// the same key. Dedupe user_ids first.
 	seen := make(map[int]struct{}, len(expired))
 	for _, e := range expired {
+		// One "expired" event per subscription (not deduped by user —
+		// each expired subscription is its own signal to its own creator).
+		s.publisher.Publish(notifications.Event{
+			SubscriptionID: e.ID,
+			UserID:         e.UserID,
+			CreatorID:      e.CreatorID,
+			Type:           notifications.EventExpired,
+		})
 		if _, ok := seen[e.UserID]; ok {
 			continue
 		}

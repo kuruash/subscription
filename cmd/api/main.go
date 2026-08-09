@@ -24,6 +24,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"subscription-service/internal/handlers"
+	"subscription-service/internal/notifications"
 	"subscription-service/internal/repository"
 	"subscription-service/internal/services"
 )
@@ -63,10 +64,22 @@ func main() {
 		log.Printf("WARN: redis ping failed (%v) — will run without cache", err)
 	}
 
+	// --- Notification queue (Phase 4) ---
+	// In-process channel; the consumer lives in THIS process because a
+	// Go channel can't be read from another process. When we swap to SQS,
+	// the consumer can move to its own binary (cmd/notifier) — the
+	// service side stays exactly the same because it only knows about
+	// notifications.Publisher.
+	notifQueue := notifications.NewQueue(128)
+	// Consumer goroutine — one is plenty at this scale.
+	notifCtx, notifCancel := context.WithCancel(context.Background())
+	defer notifCancel()
+	go notifQueue.Consume(notifCtx)
+
 	// Dependency injection, done by hand. Each layer is constructed with
 	// the one below it. No framework, no container — just function calls.
 	repo := repository.NewPostgresRepo(db)
-	svc := services.NewSubscriptionService(repo, rdb)
+	svc := services.NewSubscriptionService(repo, rdb, notifQueue)
 	h := handlers.NewSubscriptionHandler(svc)
 
 	r := gin.Default()

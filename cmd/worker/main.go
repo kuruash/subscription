@@ -25,6 +25,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 
+	"subscription-service/internal/notifications"
 	"subscription-service/internal/repository"
 	"subscription-service/internal/services"
 )
@@ -70,13 +71,22 @@ func main() {
 		log.Printf("WARN: redis ping failed (%v) — invalidations will be no-ops", err)
 	}
 
+	// In-process notification queue + consumer (Phase 4). Each process
+	// owns its own queue because Go channels don't cross process
+	// boundaries. When we swap to SQS, both API and worker publish to
+	// the same real queue and this local consumer moves to its own
+	// binary.
+	notifQueue := notifications.NewQueue(128)
+
 	repo := repository.NewPostgresRepo(db)
-	svc := services.NewSubscriptionService(repo, rdb)
+	svc := services.NewSubscriptionService(repo, rdb, notifQueue)
 
 	// A context that we can cancel on SIGINT/SIGTERM so an in-flight sweep
 	// aborts cleanly instead of being killed mid-UPDATE.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	go notifQueue.Consume(ctx)
 
 	// Watch for shutdown signals in a goroutine; cancel the ctx when one
 	// arrives so the main loop exits at the next iteration.

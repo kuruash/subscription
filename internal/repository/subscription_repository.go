@@ -23,10 +23,12 @@ var ErrDuplicateActive = errors.New("active subscription already exists for this
 var ErrNotFound = errors.New("subscription not found")
 
 // ExpiredSub is what ExpireOverdue returns per row: enough for the caller
-// to invalidate the affected user's cache without a second lookup.
+// to invalidate the affected user's cache AND publish a notification
+// event without a second lookup.
 type ExpiredSub struct {
-	ID     int
-	UserID int
+	ID        int
+	UserID    int
+	CreatorID int
 }
 
 // SubscriptionRepository is a Go interface: a set of method signatures.
@@ -220,7 +222,7 @@ func (r *postgresRepo) ExpireOverdue(ctx context.Context) ([]ExpiredSub, error) 
 		UPDATE subscriptions
 		SET status = $1
 		WHERE status = $2 AND expires_at < NOW()
-		RETURNING id, user_id
+		RETURNING id, user_id, creator_id
 	`, models.StatusExpired, models.StatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("expire overdue: %w", err)
@@ -230,7 +232,7 @@ func (r *postgresRepo) ExpireOverdue(ctx context.Context) ([]ExpiredSub, error) 
 	var out []ExpiredSub
 	for rows.Next() {
 		var e ExpiredSub
-		if err := rows.Scan(&e.ID, &e.UserID); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.CreatorID); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
