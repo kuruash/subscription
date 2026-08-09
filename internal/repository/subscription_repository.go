@@ -22,6 +22,13 @@ import (
 var ErrDuplicateActive = errors.New("active subscription already exists for this user and creator")
 var ErrNotFound = errors.New("subscription not found")
 
+// ExpiredSub is what ExpireOverdue returns per row: enough for the caller
+// to invalidate the affected user's cache without a second lookup.
+type ExpiredSub struct {
+	ID     int
+	UserID int
+}
+
 // SubscriptionRepository is a Go interface: a set of method signatures.
 // Any type that has ALL these methods automatically "implements" it —
 // no `implements` keyword, no explicit declaration. This is called
@@ -35,6 +42,12 @@ type SubscriptionRepository interface {
 	// exist or isn't active.
 	Cancel(ctx context.Context, id int) (userID int, err error)
 	Renew(ctx context.Context, id int) (*models.Subscription, error)
+
+	// ExpireOverdue flips every active-but-past-expiration subscription to
+	// 'expired' in a single atomic UPDATE and returns what changed. Safe
+	// to call as often as you want — running it on already-expired rows
+	// is a no-op (see IDEMPOTENCY note on the implementation).
+	ExpireOverdue(ctx context.Context) ([]ExpiredSub, error)
 }
 
 // postgresRepo is the concrete Postgres implementation.
@@ -173,6 +186,56 @@ func (r *postgresRepo) Cancel(ctx context.Context, id int) (int, error) {
 		return 0, err
 	}
 	return userID, nil
+}
+
+// ExpireOverdue flips overdue active subscriptions to 'expired' and
+// returns (id, user_id) for each row it changed.
+//
+// IDEMPOTENCY — why running this twice is safe:
+//   - The WHERE clause requires status = 'active'. Once a row has been
+//     flipped to 'expired' by a previous sweep, the next sweep's WHERE
+//     no longer matches it — the UPDATE returns 0 rows for that id.
+//   - This is the same "let the DB prevent the bad state" instinct as
+//     the partial unique index in Phase 1: instead of tracking "have I
+//     already processed this row?" in application code, we let the
+//     predicate itself make double-processing impossible.
+//   - RETURNING therefore only lists rows this specific sweep actually
+//     changed, which is what downstream side effects (cache invalidation,
+//     future notifications) want.
+//
+// CONCURRENCY — two workers running at once:
+//   - Postgres takes a row-level lock during UPDATE. If worker A and
+//     worker B fire simultaneously, one waits for the other, then sees
+//     status is no longer 'active' and matches zero rows. So DB-level
+//     "exactly once" is preserved even without SELECT ... FOR UPDATE
+//     SKIP LOCKED.
+//   - SKIP LOCKED would be needed if we wanted N workers to PARTITION
+//     the work (each grabbing a distinct batch to parallelize a huge
+//     backlog). We don't — one worker sweeping the whole table on a
+//     timer is fine at this scale. Documented as a Phase 3 gap; the
+//     minimal fix if we ever needed it would be to SELECT ... FOR UPDATE
+//     SKIP LOCKED LIMIT N, then UPDATE by id.
+func (r *postgresRepo) ExpireOverdue(ctx context.Context) ([]ExpiredSub, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		UPDATE subscriptions
+		SET status = $1
+		WHERE status = $2 AND expires_at < NOW()
+		RETURNING id, user_id
+	`, models.StatusExpired, models.StatusActive)
+	if err != nil {
+		return nil, fmt.Errorf("expire overdue: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ExpiredSub
+	for rows.Next() {
+		var e ExpiredSub
+		if err := rows.Scan(&e.ID, &e.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 func (r *postgresRepo) Renew(ctx context.Context, id int) (*models.Subscription, error) {

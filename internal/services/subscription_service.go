@@ -20,11 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"subscription-service/internal/cache"
 	"subscription-service/internal/models"
 	"subscription-service/internal/repository"
 )
@@ -63,12 +63,8 @@ type CreateInput struct {
 	Plan      string
 }
 
-// userListKey centralizes the cache key format so every code path — read,
-// write, invalidation — agrees on the exact string. A typo in one place
-// would silently split the cache.
-func userListKey(userID int) string {
-	return "user:" + strconv.Itoa(userID) + ":subscriptions"
-}
+// Cache key format lives in internal/cache so the worker (which also
+// invalidates) uses the exact same string. See cache.UserListKey.
 
 // -------- writes: mutate DB, then invalidate the affected user's cache --------
 
@@ -120,7 +116,7 @@ func (s *SubscriptionService) Renew(ctx context.Context, id int) (*models.Subscr
 // -------- reads: cache-aside on the list endpoint --------
 
 func (s *SubscriptionService) ListByUser(ctx context.Context, userID int) ([]models.Subscription, error) {
-	key := userListKey(userID)
+	key := cache.UserListKey(userID)
 
 	// 1. Try Redis.
 	if cached, err := s.rdb.Get(ctx, key).Bytes(); err == nil {
@@ -158,6 +154,31 @@ func (s *SubscriptionService) ListByUser(ctx context.Context, userID int) ([]mod
 	return subs, nil
 }
 
+// ExpireOverdue runs the DB sweep and invalidates one Redis key per
+// affected user. Called by the background worker on a ticker.
+//
+// The service (not the worker, not the repository) owns the invalidation
+// step for the same reason as Phase 2: cache policy is a business decision
+// and belongs next to the code that already knows about the cache. The
+// worker stays a thin scheduler.
+func (s *SubscriptionService) ExpireOverdue(ctx context.Context) ([]repository.ExpiredSub, error) {
+	expired, err := s.repo.ExpireOverdue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A user with multiple expiring subs shouldn't get multiple DELs of
+	// the same key. Dedupe user_ids first.
+	seen := make(map[int]struct{}, len(expired))
+	for _, e := range expired {
+		if _, ok := seen[e.UserID]; ok {
+			continue
+		}
+		seen[e.UserID] = struct{}{}
+		s.invalidateUserList(ctx, e.UserID)
+	}
+	return expired, nil
+}
+
 // invalidateUserList removes the cached list after a successful write.
 //
 // FAILURE MODE (KNOWN GAP, DOCUMENTED):
@@ -186,7 +207,7 @@ func (s *SubscriptionService) ListByUser(ctx context.Context, userID int) ([]mod
 // genuinely succeeded; failing the HTTP response would mislead them into
 // retrying an already-committed operation.
 func (s *SubscriptionService) invalidateUserList(ctx context.Context, userID int) {
-	key := userListKey(userID)
+	key := cache.UserListKey(userID)
 	if err := s.rdb.Del(ctx, key).Err(); err != nil {
 		log.Printf("cache DEL %s failed: %v (user may see stale list for up to %s)", key, err, listCacheTTL)
 	}

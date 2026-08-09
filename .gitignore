@@ -49,3 +49,6 @@ go.work.sum
 # --- Logs ---
 *.log
 logs/
+
+# --- MD files ---
+CLAUDE.md
