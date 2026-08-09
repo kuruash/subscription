@@ -676,5 +676,9 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 3 — Background worker that expires overdue subscriptions on a ticker~~ ✅
 - ~~Phase 4 — In-process notification queue (channel), later swapped for SQS~~ ✅
 - ~~Phase 5 — JWT auth middleware + ownership checks~~ ✅
-- Phase 5 — JWT auth middleware
-- Phase 6 — Stripe sandbox, webhooks, rate limiting, metrics, tests, CI/CD
+- Phase 6 — Automated tests (unit tests for services with a fake repo, integration tests for the repository against real Postgres)
+- Phase 7 — Stripe sandbox payments + webhooks
+- Phase 8 — Rate limiting
+- Phase 9 — Metrics endpoint
+- Phase 10 — GitHub Actions CI/CD
+- Phase 11 — Admin dashboard
