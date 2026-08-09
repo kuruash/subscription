@@ -13,6 +13,8 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"subscription-service/internal/middleware"
 	"subscription-service/internal/services"
 )
 
@@ -24,37 +26,41 @@ func NewSubscriptionHandler(svc *services.SubscriptionService) *SubscriptionHand
 	return &SubscriptionHandler{svc: svc}
 }
 
-// Register wires this handler's routes onto a Gin router. Keeping this
-// method here (instead of in main.go) means main stays small and each
-// feature owns its routing.
-func (h *SubscriptionHandler) Register(r *gin.Engine) {
-	r.POST("/subscriptions", h.create)
-	r.GET("/subscriptions/:id", h.get)
-	r.DELETE("/subscriptions/:id", h.cancel)
-	r.POST("/subscriptions/:id/renew", h.renew)
-	r.GET("/users/:id/subscriptions", h.listByUser)
+// Register wires this handler's routes onto a Gin router group.
+//
+// The caller (main.go) is responsible for putting the JWT middleware on
+// the group before passing it in — that keeps auth policy visible at
+// the composition site instead of hidden inside each handler.
+func (h *SubscriptionHandler) Register(rg *gin.RouterGroup) {
+	rg.POST("/subscriptions", h.create)
+	rg.GET("/subscriptions/:id", h.get)
+	rg.DELETE("/subscriptions/:id", h.cancel)
+	rg.POST("/subscriptions/:id/renew", h.renew)
+	rg.GET("/users/:id/subscriptions", h.listByUser)
 }
 
 type createRequest struct {
-	// `binding:"required"` is Gin's validator tag — missing fields fail
-	// ShouldBindJSON automatically, saving us a stack of `if x == 0` checks.
-	UserID    int    `json:"user_id"    binding:"required"`
 	CreatorID int    `json:"creator_id" binding:"required"`
 	Plan      string `json:"plan"       binding:"required"`
 }
 
+// create: the authenticated user is subscribing themselves — the user_id
+// comes from the JWT, NOT the body. Letting the body pick user_id would
+// let anyone subscribe on behalf of anyone else, defeating the whole
+// point of the token.
 func (h *SubscriptionHandler) create(c *gin.Context) {
+	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
+	if !ok {
+		writeError(c, services.ErrForbidden)
+		return
+	}
 	var req createRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	// c.Request.Context() carries client-disconnect / timeout signals
-	// all the way down to the DB driver. Never use context.Background()
-	// inside a handler.
 	sub, err := h.svc.Create(c.Request.Context(), services.CreateInput{
-		UserID:    req.UserID,
+		UserID:    authUserID,
 		CreatorID: req.CreatorID,
 		Plan:      req.Plan,
 	})
@@ -66,11 +72,16 @@ func (h *SubscriptionHandler) create(c *gin.Context) {
 }
 
 func (h *SubscriptionHandler) get(c *gin.Context) {
+	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
+	if !ok {
+		writeError(c, services.ErrForbidden)
+		return
+	}
 	id, err := parseID(c, "id")
 	if err != nil {
 		return
 	}
-	sub, err := h.svc.Get(c.Request.Context(), id)
+	sub, err := h.svc.GetForUser(c.Request.Context(), id, authUserID)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -79,8 +90,18 @@ func (h *SubscriptionHandler) get(c *gin.Context) {
 }
 
 func (h *SubscriptionHandler) listByUser(c *gin.Context) {
+	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
+	if !ok {
+		writeError(c, services.ErrForbidden)
+		return
+	}
 	userID, err := parseID(c, "id")
 	if err != nil {
+		return
+	}
+	// A user can only list their own subscriptions.
+	if userID != authUserID {
+		writeError(c, services.ErrForbidden)
 		return
 	}
 	subs, err := h.svc.ListByUser(c.Request.Context(), userID)
@@ -92,11 +113,16 @@ func (h *SubscriptionHandler) listByUser(c *gin.Context) {
 }
 
 func (h *SubscriptionHandler) cancel(c *gin.Context) {
+	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
+	if !ok {
+		writeError(c, services.ErrForbidden)
+		return
+	}
 	id, err := parseID(c, "id")
 	if err != nil {
 		return
 	}
-	if err := h.svc.Cancel(c.Request.Context(), id); err != nil {
+	if err := h.svc.CancelForUser(c.Request.Context(), id, authUserID); err != nil {
 		writeError(c, err)
 		return
 	}
@@ -104,11 +130,16 @@ func (h *SubscriptionHandler) cancel(c *gin.Context) {
 }
 
 func (h *SubscriptionHandler) renew(c *gin.Context) {
+	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
+	if !ok {
+		writeError(c, services.ErrForbidden)
+		return
+	}
 	id, err := parseID(c, "id")
 	if err != nil {
 		return
 	}
-	sub, err := h.svc.Renew(c.Request.Context(), id)
+	sub, err := h.svc.RenewForUser(c.Request.Context(), id, authUserID)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -136,6 +167,8 @@ func writeError(c *gin.Context, err error) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 	case errors.Is(err, services.ErrInvalidInput):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, services.ErrForbidden):
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 	}

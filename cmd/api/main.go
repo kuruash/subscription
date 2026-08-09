@@ -24,6 +24,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"subscription-service/internal/handlers"
+	"subscription-service/internal/middleware"
 	"subscription-service/internal/notifications"
 	"subscription-service/internal/repository"
 	"subscription-service/internal/services"
@@ -76,15 +77,33 @@ func main() {
 	defer notifCancel()
 	go notifQueue.Consume(notifCtx)
 
+	// --- JWT secret (Phase 5) ---
+	// Read from env, never hardcoded. In dev we fall back to a placeholder
+	// so `go run` still works, but LOG A LOUD WARNING because that
+	// secret is public knowledge (anyone reading this source can mint a
+	// token). Real deployments MUST set JWT_SECRET.
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		log.Printf("WARN: JWT_SECRET not set — using an insecure development default. DO NOT DEPLOY LIKE THIS.")
+		jwtSecret = []byte("dev-only-insecure-secret-change-me")
+	}
+
 	// Dependency injection, done by hand. Each layer is constructed with
 	// the one below it. No framework, no container — just function calls.
 	repo := repository.NewPostgresRepo(db)
 	svc := services.NewSubscriptionService(repo, rdb, notifQueue)
-	h := handlers.NewSubscriptionHandler(svc)
+	subH := handlers.NewSubscriptionHandler(svc)
+	authH := handlers.NewAuthHandler(jwtSecret)
 
 	r := gin.Default()
+	// Public routes — no auth required.
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
-	h.Register(r)
+	authH.Register(r)
+	// Protected routes — every /subscriptions and /users/:id/subscriptions
+	// path requires a valid JWT. Grouping means adding a new route to the
+	// group inherits the middleware automatically.
+	protected := r.Group("", middleware.RequireAuth(jwtSecret))
+	subH.Register(protected)
 
 	// Graceful shutdown: run the server in a goroutine, then wait for
 	// SIGINT/SIGTERM in the main goroutine. On signal, tell the server

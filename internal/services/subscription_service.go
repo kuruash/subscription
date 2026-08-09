@@ -34,6 +34,10 @@ var (
 	ErrDuplicateActive = repository.ErrDuplicateActive
 	ErrNotFound        = repository.ErrNotFound
 	ErrInvalidInput    = errors.New("invalid input")
+	// ErrForbidden = "the subscription exists, but this authenticated user
+	// doesn't own it." Deliberately distinct from ErrNotFound so handlers
+	// can return 403 vs 404 correctly. See README for the info-leak tradeoff.
+	ErrForbidden = errors.New("forbidden: you do not own this subscription")
 )
 
 var planPrices = map[string]float64{
@@ -118,12 +122,53 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id int) error {
 	return nil
 }
 
+// CancelForUser is the authenticated variant. Verifies the subscription
+// belongs to authUserID before cancelling.
+//
+// Two round trips (GetByID → Cancel) rather than one WHERE-clause check,
+// on purpose: we need to distinguish "not found" (404) from "not yours"
+// (403). A single UPDATE ... WHERE id=$1 AND user_id=$2 can't tell them
+// apart — it just returns 0 rows in both cases.
+func (s *SubscriptionService) CancelForUser(ctx context.Context, id, authUserID int) error {
+	sub, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return err // ErrNotFound flows through
+	}
+	if sub.UserID != authUserID {
+		return ErrForbidden
+	}
+	return s.Cancel(ctx, id)
+}
+
 func (s *SubscriptionService) Renew(ctx context.Context, id int) (*models.Subscription, error) {
 	sub, err := s.repo.Renew(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	s.invalidateUserList(ctx, sub.UserID)
+	return sub, nil
+}
+
+func (s *SubscriptionService) RenewForUser(ctx context.Context, id, authUserID int) (*models.Subscription, error) {
+	existing, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing.UserID != authUserID {
+		return nil, ErrForbidden
+	}
+	return s.Renew(ctx, id)
+}
+
+// GetForUser enforces ownership on a single-subscription fetch.
+func (s *SubscriptionService) GetForUser(ctx context.Context, id, authUserID int) (*models.Subscription, error) {
+	sub, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if sub.UserID != authUserID {
+		return nil, ErrForbidden
+	}
 	return sub, nil
 }
 

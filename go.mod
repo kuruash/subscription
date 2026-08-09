@@ -21,7 +21,10 @@ require (
 	github.com/lib/pq v1.10.9 // Postgres driver for database/sql
 )
 
-require github.com/redis/go-redis/v9 v9.22.0
+require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/redis/go-redis/v9 v9.22.0
+)
 
 require (
 	github.com/bytedance/sonic v1.11.6 // indirect

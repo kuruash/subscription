@@ -7,11 +7,11 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 4 complete** — core CRUD API backed by Postgres, with a
-Redis cache-aside layer on the list endpoint, a background worker that
-expires overdue subscriptions on a timer, and an in-process notification
-queue that fires "subscribed" and "expired" events to a stub consumer.
-Auth and payments come in later phases.
+**Status: Phase 5 complete** — core CRUD API backed by Postgres, Redis
+cache-aside on the list endpoint, a background worker that expires
+overdue subscriptions, an in-process notification queue, and JWT auth on
+all subscription endpoints with per-user ownership checks. Payments +
+bonus features come in Phase 6.
 
 ---
 
@@ -35,6 +35,8 @@ subscription-service/
 │   ├── repository/           # SQL layer — the only place SQL lives
 │   ├── cache/                # Redis key format helpers (shared by API + worker)
 │   ├── notifications/        # In-process event queue + stub consumer
+│   ├── auth/                 # JWT sign/parse helpers
+│   ├── middleware/           # Gin middlewares (RequireAuth)
 │   └── models/               # Plain data structs shared across layers
 ├── migrations/
 │   └── 001_init.sql          # Schema, auto-applied on first Postgres boot
@@ -90,10 +92,14 @@ go mod tidy
 go run ./cmd/api
 ```
 
-Server listens on `:8080`. Env vars:
+Server listens on `:8080`. Env vars (see `.env.example` for a copy-paste
+template):
 
 - `DATABASE_URL` — Postgres DSN (default `postgres://subs:subs@localhost:5433/subscriptions?sslmode=disable`)
 - `REDIS_ADDR` — Redis host:port (default `localhost:6379`)
+- `JWT_SECRET` — HMAC signing secret for JWTs. If unset, the API logs a
+  loud warning and uses an insecure hardcoded development default.
+  Production must set this.
 
 Health check:
 
@@ -119,14 +125,15 @@ that expire nothing, so it's obvious the process is alive.
 
 All endpoints return JSON. Errors come back as `{"error": "..."}`.
 
-| Method | Path                          | Description                          |
-|--------|-------------------------------|--------------------------------------|
-| POST   | `/subscriptions`              | Subscribe (user → creator)           |
-| GET    | `/subscriptions/:id`          | Fetch a single subscription          |
-| GET    | `/users/:id/subscriptions`    | List a user's subscriptions (cached) |
-| DELETE | `/subscriptions/:id`          | Cancel (soft delete)                 |
-| POST   | `/subscriptions/:id/renew`    | Extend `expires_at` by 30 days       |
-| GET    | `/healthz`                    | Liveness probe                       |
+| Method | Path                          | Auth | Description                          |
+|--------|-------------------------------|------|--------------------------------------|
+| POST   | `/login`                      | —    | Issue a JWT for a user_id (stub, see Phase 5) |
+| GET    | `/healthz`                    | —    | Liveness probe                       |
+| POST   | `/subscriptions`              | JWT  | Subscribe (user_id taken from JWT)   |
+| GET    | `/subscriptions/:id`          | JWT  | Fetch a single subscription (owner only) |
+| GET    | `/users/:id/subscriptions`    | JWT  | List a user's subscriptions (cached, self only) |
+| DELETE | `/subscriptions/:id`          | JWT  | Cancel (soft delete, owner only)     |
+| POST   | `/subscriptions/:id/renew`    | JWT  | Extend `expires_at` by 30 days (owner only) |
 
 ### Example: subscribe
 
@@ -160,10 +167,12 @@ index** in Postgres, not an application-level check (see below).
 
 | Code | When                                             |
 |------|--------------------------------------------------|
-| 200  | Successful GET / renew                           |
+| 200  | Successful GET / renew / login                   |
 | 201  | Successful subscribe                             |
 | 204  | Successful cancel                                |
 | 400  | Missing/invalid body or URL params               |
+| 401  | Missing, malformed, or expired JWT               |
+| 403  | Authenticated, but not the owner of this resource |
 | 404  | Subscription not found (or not active for renew) |
 | 409  | Active subscription already exists for this pair |
 | 500  | Anything else                                    |
@@ -510,6 +519,155 @@ To force the dropped-event path (mostly curiosity): lower the buffer to
 
 ---
 
+## Phase 5: JWT Authentication
+
+Every `/subscriptions*` and `/users/:id/subscriptions` route now requires
+a valid JWT. `/login` mints one; the middleware verifies it and stashes
+the authenticated user_id on the request `context.Context` so handlers
+can enforce ownership.
+
+### What's actually inside a JWT (see it yourself)
+
+A JWT is three base64-url-encoded parts joined by dots:
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9   ← header  (JSON, base64)
+.eyJ1aWQiOjEsImlzcyI6InN1YnNjcmlwdGlvbi1zZXJ2aWNlIiwic3ViIjoiMSIsImV4cCI6MTcxNjIwOTAyMiwiaWF0IjoxNzE2MjA4MTIyfQ   ← payload (JSON, base64)
+.5j3xM_...   ← signature (HMAC-SHA256 over header.payload with the secret)
+```
+
+Decode the payload yourself:
+
+```bash
+TOKEN='<paste the token>'
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq
+# or, more forgiving of URL-safe base64 padding:
+python3 -c "import sys,json,base64; p=sys.argv[1].split('.')[1]; p+='='*(-len(p)%4); print(json.dumps(json.loads(base64.urlsafe_b64decode(p)),indent=2))" "$TOKEN"
+```
+
+Or paste the token into <https://jwt.io> — the payload shows up in the
+right-hand panel.
+
+You'll see something like:
+
+```json
+{
+  "uid": 1,
+  "iss": "subscription-service",
+  "sub": "1",
+  "exp": 1716209022,
+  "iat": 1716208122
+}
+```
+
+### Signed ≠ encrypted
+
+**Anyone with the token can read the payload.** The signature only
+proves the payload wasn't modified since it was signed. So the JWT is
+tamper-evident, not confidential. Never put a password, credit-card, or
+anything else sensitive in the payload — put only identity claims you'd
+be comfortable printing in a log line.
+
+The confidentiality of the *token itself* comes from HTTPS in transit
+and from clients storing it safely (never in localStorage on hostile
+pages, etc.). It does not come from the JWT format.
+
+### 403 vs 404 on ownership failure
+
+When user 1 tries to `DELETE /subscriptions/7` and subscription 7
+belongs to user 2, we return **403**, not 404. The tradeoff:
+
+- **404** hides existence: an attacker enumerating IDs can't tell "this
+  ID exists but isn't yours" from "this ID doesn't exist." Better for
+  privacy against ID enumeration.
+- **403** is more truthful: it distinguishes "not found" from "not
+  yours," which makes debugging your own client code sane and matches
+  what most APIs (GitHub, Stripe) do.
+
+We chose 403 because the info leak here is small (IDs are sequential
+integers scoped to this service; enumerating "which IDs exist" gives an
+attacker almost nothing without also being authenticated as the right
+user), and because merging the two states silently would make legitimate
+"my client has a bug" cases indistinguishable from "the row was
+deleted." If we ever store data where ID enumeration itself is
+sensitive, we'd flip to 404.
+
+### Deliberate gaps (documented, not oversights)
+
+- **No password / credential check on /login.** POST `{"user_id": N}`
+  and you get a token for that user. This is a placeholder so the rest
+  of the auth machinery can be exercised end-to-end without also
+  building a full password-hashing/user-signup flow. A real
+  implementation would take `email + password`, compare against a
+  bcrypt hash in the users table, and only then issue a token.
+- **No refresh tokens.** Access tokens live 15 minutes and just expire.
+  Real systems pair a short-lived access token with a longer-lived
+  refresh token, so sessions can outlive an access token without
+  extending the window an attacker gets from a leaked one.
+- **No revocation / logout.** JWTs are stateless — the server doesn't
+  track "which tokens exist," it only checks the signature. So there's
+  no way to invalidate an issued token before its exp. Common fixes are
+  a revocation list in Redis or moving to stateful sessions.
+- **HS256 shared secret.** Fine for a single-service backend. If you
+  ever verify these tokens in a different service, switch to RS256 so
+  the signing secret doesn't have to leave this one.
+
+### End-to-end test
+
+```bash
+# 1. Get a token for user 1
+TOKEN=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq -r .token)
+echo "$TOKEN"
+
+# 2. Decode the payload so you can see the claims
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq
+# or paste $TOKEN into https://jwt.io
+
+# 3. Call a protected endpoint WITHOUT a token → 401
+curl -i localhost:8080/users/1/subscriptions
+# → HTTP/1.1 401 Unauthorized
+# → {"error":"missing Authorization header"}
+
+# 4. Call with a valid token → 200 (or 201)
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"creator_id":1,"plan":"monthly"}'
+# Note: no user_id in the body — it comes from the JWT.
+
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/users/1/subscriptions | jq
+# → list of user 1's subs
+
+# 5. Grab an id from step 4's response, then try to cancel it AS USER 2
+SUB_ID=<paste id>
+TOKEN2=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":2}' | jq -r .token)
+
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN2" \
+  localhost:8080/subscriptions/$SUB_ID
+# → HTTP/1.1 403 Forbidden
+# → {"error":"forbidden: you do not own this subscription"}
+
+# 6. Cancel it as the correct user → 204
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN" \
+  localhost:8080/subscriptions/$SUB_ID
+# → HTTP/1.1 204 No Content
+
+# 7. Prove token expiration is real: wait 15 minutes and repeat step 4,
+#    or edit TokenTTL in internal/auth/jwt.go to something like 5s,
+#    restart, get a token, wait 6s, use it → 401.
+```
+
+If step 5 returns 404 instead of 403, the subscription id doesn't exist
+(re-check what you pasted). If step 4 returns 401 with a fresh token,
+the API and the token were signed with different `JWT_SECRET`s — restart
+the API after any env change.
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
@@ -517,5 +675,6 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 2 — Redis cache-aside on the list endpoint + write-invalidation~~ ✅
 - ~~Phase 3 — Background worker that expires overdue subscriptions on a ticker~~ ✅
 - ~~Phase 4 — In-process notification queue (channel), later swapped for SQS~~ ✅
+- ~~Phase 5 — JWT auth middleware + ownership checks~~ ✅
 - Phase 5 — JWT auth middleware
 - Phase 6 — Stripe sandbox, webhooks, rate limiting, metrics, tests, CI/CD
