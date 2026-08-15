@@ -42,34 +42,49 @@ type Creator struct {
 // API shape ever needs to diverge from the DB shape, you introduce a
 // separate DTO/response struct rather than warping this one.
 type Subscription struct {
-	ID         int       `json:"id"`
-	UserID     int       `json:"user_id"`
-	CreatorID  int       `json:"creator_id"`
-	Plan       string    `json:"plan"`
-	Status     string    `json:"status"`
-	StartDate  time.Time `json:"start_date"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	AutoRenew  bool      `json:"auto_renew"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID        int    `json:"id"`
+	UserID    int    `json:"user_id"`
+	CreatorID int    `json:"creator_id"`
+	Plan      string `json:"plan"`
+	Status    string `json:"status"`
+	// PaymentIntentID is the Stripe PaymentIntent that created this row.
+	// Nullable in the DB (pre-Phase-7 rows have none), so we use
+	// *string here — a plain string can't represent NULL, and treating
+	// "" as NULL is the kind of foot-gun that hides real data bugs.
+	PaymentIntentID *string   `json:"payment_intent_id,omitempty"`
+	StartDate       time.Time `json:"start_date"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	AutoRenew       bool      `json:"auto_renew"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Status constants. Go doesn't have enums; the idiomatic replacement is
 // a typed set of const strings (or ints). Using these instead of raw
 // "active" literals scattered through the code prevents typos the compiler
 // can't catch (`"activ"` would silently mean "never matches").
+//
+// StatusPending is new in Phase 7: a subscription starts pending when we
+// create the Stripe PaymentIntent, then flips to active only when the
+// payment_intent.succeeded webhook confirms the charge.
 const (
+	StatusPending   = "pending"
 	StatusActive    = "active"
 	StatusCancelled = "cancelled"
 	StatusExpired   = "expired"
 )
 
 type Transaction struct {
-	ID             int       `json:"id"`
-	SubscriptionID int       `json:"subscription_id"`
-	Amount         float64   `json:"amount"`
-	Currency       string    `json:"currency"`
-	Status         string    `json:"status"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             int     `json:"id"`
+	SubscriptionID int     `json:"subscription_id"`
+	Amount         float64 `json:"amount"`
+	Currency       string  `json:"currency"`
+	Status         string  `json:"status"`
+	// StripeEventID is the webhook event id that caused this transaction
+	// to be written. Nullable for the same reason as above (pre-Phase-7
+	// rows have none). The DB has a partial UNIQUE index on non-NULL
+	// values — that's what makes webhook processing idempotent.
+	StripeEventID *string   `json:"stripe_event_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 const (

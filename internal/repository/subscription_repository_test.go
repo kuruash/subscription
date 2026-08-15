@@ -59,7 +59,10 @@ func TestMain(m *testing.M) {
 		tcpostgres.WithDatabase("subs_test"),
 		tcpostgres.WithUsername("subs"),
 		tcpostgres.WithPassword("subs"),
-		tcpostgres.WithInitScripts("../../migrations/001_init.sql"),
+		tcpostgres.WithInitScripts(
+			"../../migrations/001_init.sql",
+			"../../migrations/002_add_pending_status.sql",
+		),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).

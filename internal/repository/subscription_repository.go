@@ -93,13 +93,18 @@ func (r *postgresRepo) Create(ctx context.Context, sub *models.Subscription, amo
 	// QueryRowContext with RETURNING gets the DB-assigned id + created_at
 	// back in the same round trip. Scan() reads the returned columns into
 	// the pointers you pass.
+	// payment_intent_id is included in the column list even when nil so this
+	// same statement works for the old ("insert as active immediately")
+	// and new Phase-7 ("insert as pending with a PI attached") call paths
+	// without needing two variants of the INSERT. lib/pq turns a nil
+	// *string into SQL NULL for us.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO subscriptions
-		    (user_id, creator_id, plan, status, start_date, expires_at, auto_renew)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		    (user_id, creator_id, plan, status, start_date, expires_at, auto_renew, payment_intent_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at
 	`, sub.UserID, sub.CreatorID, sub.Plan, sub.Status,
-		sub.StartDate, sub.ExpiresAt, sub.AutoRenew,
+		sub.StartDate, sub.ExpiresAt, sub.AutoRenew, sub.PaymentIntentID,
 	).Scan(&sub.ID, &sub.CreatedAt)
 
 	if err != nil {
@@ -114,6 +119,12 @@ func (r *postgresRepo) Create(ctx context.Context, sub *models.Subscription, amo
 	}
 
 	// Second write in the same transaction — the payment record.
+	// stripe_event_id is left as SQL default NULL here: this pre-Phase-7
+	// code path doesn't have a Stripe event yet. The Phase 7 webhook
+	// handler is what will INSERT transactions with a non-null
+	// stripe_event_id and rely on the partial UNIQUE index for
+	// idempotency. Leaving the column out of this INSERT (rather than
+	// passing an explicit NULL) keeps that intent visible.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO transactions (subscription_id, amount, currency, status)
 		VALUES ($1, $2, 'usd', $3)
@@ -131,9 +142,10 @@ func (r *postgresRepo) Create(ctx context.Context, sub *models.Subscription, amo
 func (r *postgresRepo) GetByID(ctx context.Context, id int) (*models.Subscription, error) {
 	var s models.Subscription
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, user_id, creator_id, plan, status, start_date, expires_at, auto_renew, created_at
+		SELECT id, user_id, creator_id, plan, status, payment_intent_id,
+		       start_date, expires_at, auto_renew, created_at
 		FROM subscriptions WHERE id = $1
-	`, id).Scan(&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status,
+	`, id).Scan(&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
 		&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -146,7 +158,8 @@ func (r *postgresRepo) GetByID(ctx context.Context, id int) (*models.Subscriptio
 
 func (r *postgresRepo) ListByUser(ctx context.Context, userID int) ([]models.Subscription, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, user_id, creator_id, plan, status, start_date, expires_at, auto_renew, created_at
+		SELECT id, user_id, creator_id, plan, status, payment_intent_id,
+		       start_date, expires_at, auto_renew, created_at
 		FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC
 	`, userID)
 	if err != nil {
@@ -161,7 +174,7 @@ func (r *postgresRepo) ListByUser(ctx context.Context, userID int) ([]models.Sub
 	var out []models.Subscription
 	for rows.Next() {
 		var s models.Subscription
-		if err := rows.Scan(&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status,
+		if err := rows.Scan(&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
 			&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -248,9 +261,10 @@ func (r *postgresRepo) Renew(ctx context.Context, id int) (*models.Subscription,
 		UPDATE subscriptions
 		SET expires_at = expires_at + interval '30 days'
 		WHERE id = $1 AND status = $2
-		RETURNING id, user_id, creator_id, plan, status, start_date, expires_at, auto_renew, created_at
+		RETURNING id, user_id, creator_id, plan, status, payment_intent_id,
+		          start_date, expires_at, auto_renew, created_at
 	`, id, models.StatusActive).Scan(
-		&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status,
+		&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
 		&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
