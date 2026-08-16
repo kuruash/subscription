@@ -30,6 +30,7 @@ import (
 	"subscription-service/internal/cache"
 	"subscription-service/internal/models"
 	"subscription-service/internal/notifications"
+	"subscription-service/internal/payments"
 	"subscription-service/internal/repository"
 	"subscription-service/internal/services"
 )
@@ -43,19 +44,33 @@ import (
 // any un-set method returns a zero value or an "unexpected call" error
 // so a misconfigured test fails loudly instead of silently.
 type fakeRepo struct {
-	CreateFn        func(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error)
-	GetByIDFn       func(ctx context.Context, id int) (*models.Subscription, error)
-	ListByUserFn    func(ctx context.Context, userID int) ([]models.Subscription, error)
-	CancelFn        func(ctx context.Context, id int) (int, error)
-	RenewFn         func(ctx context.Context, id int) (*models.Subscription, error)
-	ExpireOverdueFn func(ctx context.Context) ([]repository.ExpiredSub, error)
+	CreatePendingFn        func(ctx context.Context, sub *models.Subscription) (*models.Subscription, error)
+	MarkPaymentSucceededFn func(ctx context.Context, paymentIntentID, stripeEventID string, amountCents int64) (*models.Subscription, error)
+	MarkPaymentFailedFn    func(ctx context.Context, paymentIntentID string) (*models.Subscription, error)
+	GetByIDFn              func(ctx context.Context, id int) (*models.Subscription, error)
+	ListByUserFn           func(ctx context.Context, userID int) ([]models.Subscription, error)
+	CancelFn               func(ctx context.Context, id int) (int, error)
+	RenewFn                func(ctx context.Context, id int) (*models.Subscription, error)
+	ExpireOverdueFn        func(ctx context.Context) ([]repository.ExpiredSub, error)
 }
 
-func (f *fakeRepo) Create(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error) {
-	if f.CreateFn == nil {
-		return nil, errors.New("fakeRepo.Create: unexpected call")
+func (f *fakeRepo) CreatePending(ctx context.Context, sub *models.Subscription) (*models.Subscription, error) {
+	if f.CreatePendingFn == nil {
+		return nil, errors.New("fakeRepo.CreatePending: unexpected call")
 	}
-	return f.CreateFn(ctx, sub, amount)
+	return f.CreatePendingFn(ctx, sub)
+}
+func (f *fakeRepo) MarkPaymentSucceeded(ctx context.Context, paymentIntentID, stripeEventID string, amountCents int64) (*models.Subscription, error) {
+	if f.MarkPaymentSucceededFn == nil {
+		return nil, errors.New("fakeRepo.MarkPaymentSucceeded: unexpected call")
+	}
+	return f.MarkPaymentSucceededFn(ctx, paymentIntentID, stripeEventID, amountCents)
+}
+func (f *fakeRepo) MarkPaymentFailed(ctx context.Context, paymentIntentID string) (*models.Subscription, error) {
+	if f.MarkPaymentFailedFn == nil {
+		return nil, errors.New("fakeRepo.MarkPaymentFailed: unexpected call")
+	}
+	return f.MarkPaymentFailedFn(ctx, paymentIntentID)
 }
 func (f *fakeRepo) GetByID(ctx context.Context, id int) (*models.Subscription, error) {
 	if f.GetByIDFn == nil {
@@ -86,6 +101,35 @@ func (f *fakeRepo) ExpireOverdue(ctx context.Context) ([]repository.ExpiredSub, 
 		return nil, errors.New("fakeRepo.ExpireOverdue: unexpected call")
 	}
 	return f.ExpireOverdueFn(ctx)
+}
+
+// fakePayments satisfies payments.Client via per-method function
+// overrides — same pattern as fakeRepo. Tests wire only the methods
+// they exercise; anything unset returns a loud "unexpected call" error
+// so a misconfigured test fails immediately with a clear signal instead
+// of returning a plausible-looking zero value.
+type fakePayments struct {
+	CreatePaymentIntentFn     func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error)
+	VerifyWebhookSignatureFn  func(payload []byte, sigHeader string) (*payments.Event, error)
+	// CreatePaymentIntentCalls counts invocations — needed to prove
+	// negative-space claims (e.g. "CreatePending was NOT called" is
+	// asserted via the *repo* fake's call log, but "CreatePaymentIntent
+	// was called exactly once" is asserted here).
+	CreatePaymentIntentCalls int
+}
+
+func (p *fakePayments) CreatePaymentIntent(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error) {
+	p.CreatePaymentIntentCalls++
+	if p.CreatePaymentIntentFn == nil {
+		return nil, errors.New("fakePayments.CreatePaymentIntent: unexpected call")
+	}
+	return p.CreatePaymentIntentFn(ctx, amountCents, currency, metadata)
+}
+func (p *fakePayments) VerifyWebhookSignature(payload []byte, sigHeader string) (*payments.Event, error) {
+	if p.VerifyWebhookSignatureFn == nil {
+		return nil, errors.New("fakePayments.VerifyWebhookSignature: unexpected call")
+	}
+	return p.VerifyWebhookSignatureFn(payload, sigHeader)
 }
 
 // fakePublisher records everything the service publishes so tests can
@@ -150,6 +194,7 @@ type harness struct {
 	svc  *services.SubscriptionService
 	repo *fakeRepo
 	pub  *fakePublisher
+	pay  *fakePayments
 	dels *delSpy
 }
 
@@ -162,50 +207,213 @@ func newHarness(t *testing.T) *harness {
 
 	repo := &fakeRepo{}
 	pub := &fakePublisher{}
-	svc := services.NewSubscriptionService(repo, rdb, pub)
+	pay := &fakePayments{}
+	svc := services.NewSubscriptionService(repo, rdb, pub, pay)
 
-	return &harness{svc: svc, repo: repo, pub: pub, dels: spy}
+	return &harness{svc: svc, repo: repo, pub: pub, pay: pay, dels: spy}
 }
 
 // -----------------------------------------------------------------------------
-// Create
+// Subscribe (Phase 7)
 // -----------------------------------------------------------------------------
 
-func TestCreate_Success(t *testing.T) {
+func TestSubscribe_Success(t *testing.T) {
 	h := newHarness(t)
-	h.repo.CreateFn = func(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error) {
+
+	// Track CreatePending calls so we can assert on the sub the service
+	// hands to the repo (status must be pending, PI id must be attached).
+	var createPendingCalls int
+	var handedToRepo *models.Subscription
+	h.pay.CreatePaymentIntentFn = func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error) {
+		if amountCents != 499 {
+			t.Errorf("want amountCents=499 (monthly plan), got %d", amountCents)
+		}
+		if currency != "usd" {
+			t.Errorf("want currency=usd, got %s", currency)
+		}
+		return &payments.PaymentIntent{ID: "pi_test_abc", ClientSecret: "pi_test_abc_secret_xyz"}, nil
+	}
+	h.repo.CreatePendingFn = func(ctx context.Context, sub *models.Subscription) (*models.Subscription, error) {
+		createPendingCalls++
+		handedToRepo = sub
 		sub.ID = 42
 		return sub, nil
 	}
 
-	got, err := h.svc.Create(context.Background(), services.CreateInput{
+	got, clientSecret, err := h.svc.Subscribe(context.Background(), services.SubscribeInput{
 		UserID: 7, CreatorID: 3, Plan: "monthly",
 	})
 	if err != nil {
-		t.Fatalf("Create returned error: %v", err)
+		t.Fatalf("Subscribe returned error: %v", err)
 	}
 	if got.ID != 42 || got.UserID != 7 || got.CreatorID != 3 {
 		t.Errorf("unexpected sub: %+v", got)
 	}
-	evs := h.pub.snapshot()
-	if len(evs) != 1 || evs[0].Type != notifications.EventSubscribed || evs[0].SubscriptionID != 42 {
-		t.Errorf("expected one subscribed event for sub 42, got %+v", evs)
+	if clientSecret != "pi_test_abc_secret_xyz" {
+		t.Errorf("client_secret not propagated: got %q", clientSecret)
+	}
+	if createPendingCalls != 1 {
+		t.Errorf("want 1 CreatePending call, got %d", createPendingCalls)
+	}
+	if handedToRepo.PaymentIntentID == nil || *handedToRepo.PaymentIntentID != "pi_test_abc" {
+		t.Errorf("payment_intent_id not attached to sub before CreatePending: %+v", handedToRepo.PaymentIntentID)
+	}
+	// Subscribe must NOT publish EventSubscribed — that's the webhook's job.
+	if evs := h.pub.snapshot(); len(evs) != 0 {
+		t.Errorf("Subscribe must not publish; got %+v", evs)
+	}
+	// Cache invalidation should have fired for user 7.
+	if got7 := h.dels.countFor(cache.UserListKey(7)); got7 != 1 {
+		t.Errorf("expected 1 DEL for user 7, got %d", got7)
 	}
 }
 
-func TestCreate_DuplicateActive(t *testing.T) {
+// PaymentIntent failure must short-circuit BEFORE CreatePending is
+// called. This is the Stripe-first ordering invariant: if we ever
+// regress to DB-first, this test fails because CreatePending would
+// get called and the "unexpected call" guard trips.
+func TestSubscribe_PaymentIntentFailure_DoesNotTouchRepo(t *testing.T) {
 	h := newHarness(t)
-	h.repo.CreateFn = func(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error) {
+	h.pay.CreatePaymentIntentFn = func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error) {
+		return nil, errors.New("stripe unreachable")
+	}
+	// Deliberately leave h.repo.CreatePendingFn = nil. If Subscribe calls
+	// it, the fake returns "unexpected call" and the test surfaces that.
+
+	_, _, err := h.svc.Subscribe(context.Background(), services.SubscribeInput{
+		UserID: 7, CreatorID: 3, Plan: "monthly",
+	})
+	if err == nil {
+		t.Fatal("expected error when payments client fails")
+	}
+	if !strings.Contains(err.Error(), "stripe unreachable") {
+		t.Errorf("original error should propagate; got %v", err)
+	}
+	if h.pay.CreatePaymentIntentCalls != 1 {
+		t.Errorf("want CreatePaymentIntent called exactly once, got %d", h.pay.CreatePaymentIntentCalls)
+	}
+	if evs := h.pub.snapshot(); len(evs) != 0 {
+		t.Errorf("no event should be published on payment failure; got %+v", evs)
+	}
+}
+
+// If Stripe succeeded but the DB write failed, the caller must see the
+// real error — don't silently swallow it because the PI happens to exist.
+func TestSubscribe_CreatePendingFailure_SurfacesError(t *testing.T) {
+	h := newHarness(t)
+	h.pay.CreatePaymentIntentFn = func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error) {
+		return &payments.PaymentIntent{ID: "pi_test_dupe", ClientSecret: "pi_test_dupe_secret"}, nil
+	}
+	h.repo.CreatePendingFn = func(ctx context.Context, sub *models.Subscription) (*models.Subscription, error) {
 		return nil, repository.ErrDuplicateActive
 	}
-	_, err := h.svc.Create(context.Background(), services.CreateInput{
+
+	_, clientSecret, err := h.svc.Subscribe(context.Background(), services.SubscribeInput{
 		UserID: 1, CreatorID: 1, Plan: "monthly",
 	})
 	if !errors.Is(err, services.ErrDuplicateActive) {
 		t.Fatalf("want ErrDuplicateActive, got %v", err)
 	}
-	if len(h.pub.snapshot()) != 0 {
-		t.Errorf("no event should be published when Create fails")
+	if clientSecret != "" {
+		t.Errorf("no client_secret should be returned on DB failure; got %q", clientSecret)
+	}
+	if evs := h.pub.snapshot(); len(evs) != 0 {
+		t.Errorf("no event should publish when Subscribe fails; got %+v", evs)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// MarkPaymentSucceeded (Phase 7 webhook-only path)
+// -----------------------------------------------------------------------------
+
+// First delivery of an event flips the sub to active AND publishes
+// EventSubscribed exactly once. This is where the "creator gets notified
+// on subscribe" contract actually lives in Phase 7 — Subscribe itself
+// no longer publishes.
+func TestMarkPaymentSucceeded_PublishesOnceOnFirstDelivery(t *testing.T) {
+	h := newHarness(t)
+	h.repo.MarkPaymentSucceededFn = func(ctx context.Context, piID, evtID string, amountCents int64) (*models.Subscription, error) {
+		return &models.Subscription{ID: 42, UserID: 7, CreatorID: 3, Status: models.StatusActive}, nil
+	}
+
+	sub, err := h.svc.MarkPaymentSucceeded(context.Background(), "pi_test_abc", "evt_first", 499)
+	if err != nil {
+		t.Fatalf("MarkPaymentSucceeded: %v", err)
+	}
+	if sub.Status != models.StatusActive {
+		t.Errorf("want active, got %s", sub.Status)
+	}
+	evs := h.pub.snapshot()
+	if len(evs) != 1 || evs[0].Type != notifications.EventSubscribed || evs[0].SubscriptionID != 42 {
+		t.Errorf("want one EventSubscribed for sub 42, got %+v", evs)
+	}
+	if got7 := h.dels.countFor(cache.UserListKey(7)); got7 != 1 {
+		t.Errorf("expected 1 DEL for user 7, got %d", got7)
+	}
+}
+
+// Idempotency: a redelivered event returns ErrDuplicateEvent and does
+// NOT publish a second notification. This is the CORE Phase 7 guarantee
+// — the repo layer enforces it via the stripe_event_id UNIQUE index;
+// this test proves the service respects it (short-circuits before the
+// publish) instead of double-notifying.
+func TestMarkPaymentSucceeded_DuplicateEventDoesNotDoublePublish(t *testing.T) {
+	h := newHarness(t)
+
+	var repoCalls int
+	h.repo.MarkPaymentSucceededFn = func(ctx context.Context, piID, evtID string, amountCents int64) (*models.Subscription, error) {
+		repoCalls++
+		if repoCalls == 1 {
+			return &models.Subscription{ID: 42, UserID: 7, CreatorID: 3, Status: models.StatusActive}, nil
+		}
+		// Second delivery simulates the partial UNIQUE index rejecting
+		// the duplicate transaction insert.
+		return nil, repository.ErrDuplicateEvent
+	}
+
+	// First delivery.
+	if _, err := h.svc.MarkPaymentSucceeded(context.Background(), "pi_test_abc", "evt_same", 499); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	// Second delivery of the same event id.
+	_, err := h.svc.MarkPaymentSucceeded(context.Background(), "pi_test_abc", "evt_same", 499)
+	if !errors.Is(err, services.ErrDuplicateEvent) {
+		t.Fatalf("second delivery: want ErrDuplicateEvent, got %v", err)
+	}
+
+	// Exactly one publish — even though MarkPaymentSucceeded was called
+	// twice. This is the whole point.
+	evs := h.pub.snapshot()
+	if len(evs) != 1 {
+		t.Errorf("want exactly 1 EventSubscribed across both deliveries, got %d: %+v", len(evs), evs)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// MarkPaymentFailed (webhook-only)
+// -----------------------------------------------------------------------------
+
+// payment_failed cancels the pending row and invalidates the user's
+// cache but publishes NOTHING — a failed payment attempt isn't a
+// business event a creator cares about.
+func TestMarkPaymentFailed_InvalidatesButDoesNotPublish(t *testing.T) {
+	h := newHarness(t)
+	h.repo.MarkPaymentFailedFn = func(ctx context.Context, piID string) (*models.Subscription, error) {
+		return &models.Subscription{ID: 42, UserID: 7, CreatorID: 3, Status: models.StatusCancelled}, nil
+	}
+
+	sub, err := h.svc.MarkPaymentFailed(context.Background(), "pi_test_abc")
+	if err != nil {
+		t.Fatalf("MarkPaymentFailed: %v", err)
+	}
+	if sub.Status != models.StatusCancelled {
+		t.Errorf("want cancelled, got %s", sub.Status)
+	}
+	if evs := h.pub.snapshot(); len(evs) != 0 {
+		t.Errorf("MarkPaymentFailed must not publish; got %+v", evs)
+	}
+	if got7 := h.dels.countFor(cache.UserListKey(7)); got7 != 1 {
+		t.Errorf("expected 1 DEL for user 7, got %d", got7)
 	}
 }
 

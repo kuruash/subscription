@@ -113,37 +113,89 @@ func resetDB(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// The partial unique index guarantee (Phase 1)
+// The partial unique index guarantee (Phase 1, widened in Phase 7)
+//
+// After migration 002 the partial unique index covers status IN
+// ('active', 'pending'), not just 'active'. This test proves the widened
+// index still rejects duplicates during the Phase 7 pending flow — you
+// can't stack multiple pending subscriptions for the same (user, creator)
+// pair by spamming Subscribe before any of them pay.
 // -----------------------------------------------------------------------------
 
-func TestCreate_PartialUniqueIndexRejectsSecondActive(t *testing.T) {
+func TestCreatePending_PartialUniqueIndexRejectsSecondPending(t *testing.T) {
 	resetDB(t)
 	repo := repository.NewPostgresRepo(testDB)
 	ctx := context.Background()
 
-	// First subscribe — should succeed.
-	first := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true}
-	if _, err := repo.Create(ctx, first, 4.99); err != nil {
-		t.Fatalf("first create: %v", err)
+	pi1 := "pi_test_first"
+	first := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true, PaymentIntentID: &pi1}
+	if _, err := repo.CreatePending(ctx, first); err != nil {
+		t.Fatalf("first CreatePending: %v", err)
 	}
 
-	// Second subscribe for the same (user, creator) while first is still
-	// active — the partial unique index must reject it. This is the
-	// Phase 1 race-condition guarantee.
-	second := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true}
-	_, err := repo.Create(ctx, second, 4.99)
+	// Second pending subscribe for the same (user, creator) while the
+	// first is still pending — the widened partial unique index must
+	// reject it.
+	pi2 := "pi_test_second"
+	second := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true, PaymentIntentID: &pi2}
+	_, err := repo.CreatePending(ctx, second)
 	if !errors.Is(err, repository.ErrDuplicateActive) {
-		t.Fatalf("expected ErrDuplicateActive, got %v", err)
+		t.Fatalf("expected ErrDuplicateActive on second pending, got %v", err)
 	}
 
-	// Cancel the first, then a re-subscribe should succeed (the index
-	// only cares about ACTIVE rows).
-	if _, err := repo.Cancel(ctx, first.ID); err != nil {
-		t.Fatalf("cancel: %v", err)
+	// Fail the first (payment_failed webhook), then re-subscribe: should
+	// succeed because 'cancelled' rows are excluded from the index.
+	if _, err := repo.MarkPaymentFailed(ctx, pi1); err != nil {
+		t.Fatalf("MarkPaymentFailed: %v", err)
 	}
-	third := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true}
-	if _, err := repo.Create(ctx, third, 4.99); err != nil {
-		t.Fatalf("re-subscribe after cancel should succeed: %v", err)
+	pi3 := "pi_test_third"
+	third := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true, PaymentIntentID: &pi3}
+	if _, err := repo.CreatePending(ctx, third); err != nil {
+		t.Fatalf("re-subscribe after payment_failed should succeed: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase 7 idempotency: MarkPaymentSucceeded must be safe under redelivery.
+// -----------------------------------------------------------------------------
+
+func TestMarkPaymentSucceeded_IdempotentOnDuplicateEvent(t *testing.T) {
+	resetDB(t)
+	repo := repository.NewPostgresRepo(testDB)
+	ctx := context.Background()
+
+	pi := "pi_test_success"
+	sub := &models.Subscription{UserID: 1, CreatorID: 1, Plan: "monthly", AutoRenew: true, PaymentIntentID: &pi}
+	if _, err := repo.CreatePending(ctx, sub); err != nil {
+		t.Fatalf("CreatePending: %v", err)
+	}
+
+	evt := "evt_test_first_delivery"
+
+	// First delivery: pending → active, transaction row written.
+	first, err := repo.MarkPaymentSucceeded(ctx, pi, evt, 499)
+	if err != nil {
+		t.Fatalf("first MarkPaymentSucceeded: %v", err)
+	}
+	if first.Status != models.StatusActive {
+		t.Errorf("first delivery: want status active, got %s", first.Status)
+	}
+
+	// Second delivery of the SAME event id: must return ErrDuplicateEvent
+	// so the handler can 200 to Stripe without double-processing.
+	_, err = repo.MarkPaymentSucceeded(ctx, pi, evt, 499)
+	if !errors.Is(err, repository.ErrDuplicateEvent) {
+		t.Fatalf("second delivery: want ErrDuplicateEvent, got %v", err)
+	}
+
+	// Exactly one transaction row for that event id — proves the second
+	// delivery didn't sneak an extra row in before failing.
+	var count int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM transactions WHERE stripe_event_id = $1`, evt).Scan(&count); err != nil {
+		t.Fatalf("count transactions: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 transaction row for event %s, got %d", evt, count)
 	}
 }
 

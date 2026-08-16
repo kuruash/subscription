@@ -7,11 +7,15 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 5 complete** — core CRUD API backed by Postgres, Redis
+**Status: Phase 7 complete** — core CRUD API backed by Postgres, Redis
 cache-aside on the list endpoint, a background worker that expires
-overdue subscriptions, an in-process notification queue, and JWT auth on
-all subscription endpoints with per-user ownership checks. Payments +
-bonus features come in Phase 6.
+overdue subscriptions, an in-process notification queue, JWT auth on
+all subscription endpoints with per-user ownership checks, an automated
+test suite (service-layer unit tests + repository integration tests
+against real Postgres via testcontainers), and **Stripe sandbox
+payments with idempotent webhook processing** — subscriptions now start
+in `pending` state and flip to `active` only when Stripe confirms the
+PaymentIntent via webhook.
 
 ---
 
@@ -37,9 +41,11 @@ subscription-service/
 │   ├── notifications/        # In-process event queue + stub consumer
 │   ├── auth/                 # JWT sign/parse helpers
 │   ├── middleware/           # Gin middlewares (RequireAuth)
+│   ├── payments/             # Stripe SDK isolated here — only place that imports stripe-go
 │   └── models/               # Plain data structs shared across layers
 ├── migrations/
-│   └── 001_init.sql          # Schema, auto-applied on first Postgres boot
+│   ├── 001_init.sql          # Base schema, auto-applied on first Postgres boot
+│   └── 002_add_pending_status.sql   # Phase 7: payment_intent_id, stripe_event_id, widened partial index
 ├── docker-compose.yml        # Postgres + Redis
 ├── go.mod / go.sum
 └── subscription-service-architecture.md
@@ -100,6 +106,32 @@ template):
 - `JWT_SECRET` — HMAC signing secret for JWTs. If unset, the API logs a
   loud warning and uses an insecure hardcoded development default.
   Production must set this.
+- `STRIPE_SECRET_KEY` — Stripe test-mode secret key (`sk_test_...`)
+  from <https://dashboard.stripe.com/test/apikeys>. Required for
+  `POST /subscriptions` (creates PaymentIntents).
+- `STRIPE_WEBHOOK_SECRET` — signing secret for webhook signature
+  verification (`whsec_...`). For local dev this comes from the Stripe
+  CLI: `stripe listen --print-secret`, NOT the dashboard. Required for
+  `POST /webhooks/stripe`.
+
+**`go run` does NOT auto-load `.env`.** Either export vars in your shell
+manually or load the file first:
+
+```bash
+set -a; source .env; set +a
+go run ./cmd/api
+```
+
+At startup the API prints a fingerprint line so you can eyeball-verify
+the secrets it loaded:
+
+```
+stripe: SECRET_KEY=sk_test_51OV... WEBHOOK_SECRET=whsec_6a4889...
+```
+
+If either fingerprint doesn't match `stripe listen --print-secret` (or
+your dashboard for `sk_test_...`), your shell env is stale — fix it
+before touching anything else.
 
 Health check:
 
@@ -129,39 +161,54 @@ All endpoints return JSON. Errors come back as `{"error": "..."}`.
 |--------|-------------------------------|------|--------------------------------------|
 | POST   | `/login`                      | —    | Issue a JWT for a user_id (stub, see Phase 5) |
 | GET    | `/healthz`                    | —    | Liveness probe                       |
-| POST   | `/subscriptions`              | JWT  | Subscribe (user_id taken from JWT)   |
+| POST   | `/webhooks/stripe`            | Stripe signature | Payment lifecycle events (see Phase 7) |
+| POST   | `/subscriptions`              | JWT  | Subscribe — creates pending sub + Stripe PaymentIntent; returns client_secret |
 | GET    | `/subscriptions/:id`          | JWT  | Fetch a single subscription (owner only) |
 | GET    | `/users/:id/subscriptions`    | JWT  | List a user's subscriptions (cached, self only) |
 | DELETE | `/subscriptions/:id`          | JWT  | Cancel (soft delete, owner only)     |
 | POST   | `/subscriptions/:id/renew`    | JWT  | Extend `expires_at` by 30 days (owner only) |
 
-### Example: subscribe
+### Example: subscribe (Phase 7 flow — pending until paid)
 
 ```bash
 curl -X POST localhost:8080/subscriptions \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"user_id":1,"creator_id":1,"plan":"monthly"}'
+  -d '{"creator_id":1,"plan":"monthly"}'
 ```
+
+`user_id` is NOT in the body — it comes from the JWT.
 
 Response `201 Created`:
 
 ```json
 {
-  "id": 1,
-  "user_id": 1,
-  "creator_id": 1,
-  "plan": "monthly",
-  "status": "active",
-  "start_date": "2026-08-04T...",
-  "expires_at": "2026-09-03T...",
-  "auto_renew": true,
-  "created_at": "2026-08-04T..."
+  "subscription": {
+    "id": 12,
+    "user_id": 1,
+    "creator_id": 1,
+    "plan": "monthly",
+    "status": "pending",
+    "payment_intent_id": "pi_3U59UcA5tRvT4bBk0yDRaAiT",
+    "start_date": "2026-08-16T...",
+    "expires_at": "2026-09-15T...",
+    "auto_renew": true,
+    "created_at": "2026-08-16T..."
+  },
+  "client_secret": "pi_3U59UcA5tRvT4bBk0yDRaAiT_secret_..."
 }
 ```
 
-Attempting to subscribe the same user to the same creator while an active
-subscription exists returns `409 Conflict` — enforced by a **partial unique
-index** in Postgres, not an application-level check (see below).
+The subscription starts as `"status": "pending"` and does not become
+`"active"` until Stripe confirms the payment and delivers a
+`payment_intent.succeeded` webhook to us. The `client_secret` is what
+a frontend (or the Stripe CLI, see Phase 7 test recipe) uses to actually
+confirm the payment.
+
+Attempting to subscribe the same user to the same creator while an
+`active` OR `pending` subscription exists returns `409 Conflict` —
+enforced by a **partial unique index** in Postgres (widened in
+migration 002 to cover pending), not an application-level check.
 
 ### Status codes
 
@@ -668,6 +715,200 @@ the API after any env change.
 
 ---
 
+## Phase 7: Stripe payments (pending-until-paid)
+
+Subscribes are now **two-phase**: the API creates a `pending`
+subscription and a Stripe PaymentIntent, returns the `client_secret`,
+and the subscription only flips to `active` when Stripe delivers a
+`payment_intent.succeeded` webhook.
+
+### Flow
+
+1. `POST /subscriptions` (authenticated user).
+2. Service calls `payments.CreatePaymentIntent` — Stripe returns a
+   `pi_...` id and `client_secret`. **Stripe first, DB second**: if the
+   DB write fails, the orphan PaymentIntent auto-expires in Stripe
+   within ~24h — bounded, self-cleaning failure. The reverse order
+   would leave an orphan `pending` row that the partial unique index
+   would then block re-subscribe on.
+3. Service inserts the subscription with `status='pending'` and
+   `payment_intent_id=pi_...`.
+4. API returns `{subscription, client_secret}` (see the response
+   example above).
+5. Client confirms the payment with Stripe using the `client_secret`
+   (real frontends: `stripe.confirmPayment(...)`; here: the Stripe CLI).
+6. Stripe sends `payment_intent.succeeded` to `POST /webhooks/stripe`.
+7. Webhook handler verifies the signature, then calls
+   `service.MarkPaymentSucceeded(pi_id, event_id, amount_cents)` which
+   atomically (a) INSERTs a transactions row tagged with the
+   `stripe_event_id`, then (b) UPDATEs the subscription to `active`.
+8. Service invalidates the user's Redis list key and publishes
+   `EventSubscribed`. This is the ONLY place `EventSubscribed` is
+   published in Phase 7 — the Subscribe path no longer publishes,
+   because "user subscribed AND paid" isn't a fact until Stripe
+   confirms.
+
+### Idempotency (redelivery guarantee)
+
+Stripe retries webhook deliveries on any non-2xx for up to ~3 days.
+Our correctness under retries hinges on **`transactions.stripe_event_id`
+having a partial UNIQUE index** (from migration 002).
+
+- **First delivery:** transaction INSERT succeeds → subscription UPDATE
+  flips pending → active → `200 OK` to Stripe.
+- **Redelivery of the same `evt_...`:** transaction INSERT fails with
+  Postgres error code 23505 → repo returns `ErrDuplicateEvent` → the
+  UPDATE never runs → cache DEL and notification publish are
+  short-circuited → `200 OK` to Stripe.
+
+Net effect across any number of redeliveries of the same event:
+exactly one transaction row, exactly one subscription state change,
+exactly one notification.
+
+We chose **INSERT-then-UPDATE** order (not UPDATE-then-INSERT) so that
+"transaction row exists ⇔ event was processed" is an atomic invariant.
+Reversing the order would let a redelivered event no-op the UPDATE
+(row is already active), then fail the INSERT — same net outcome, but
+the state machine becomes harder to reason about because subscription
+status is no longer a reliable signal of event-processing completion.
+
+### Public webhook route + raw body preservation
+
+`POST /webhooks/stripe` is registered on the root router **without**
+the JWT middleware — Stripe is the caller, not a user. The signature
+check inside the handler is the only thing standing between us and a
+forged "the customer paid" payload from a random attacker, so bad
+signature → **400 with no logs of payload contents**.
+
+Stripe computes the HMAC over the **exact bytes** of the request body.
+Anything that reads or mutates the body before our handler will
+invalidate the signature. Current defense: the route is registered
+**before** any body-reading middleware exists in the router chain
+(`gin.Default()` only wires Logger and Recovery, neither of which
+reads the body). If future work adds body-parsing middleware, either
+register it on a router group that excludes `/webhooks/stripe`, or
+add an early `Next()` bypass inside the middleware for that path.
+
+### Status codes the webhook returns
+
+| Situation                                         | Status | Why |
+|---------------------------------------------------|--------|-----|
+| Bad signature                                     | 400    | Only defense on a public endpoint |
+| `payment_intent.succeeded` processed fresh        | 200    | Recorded, Stripe stops retrying |
+| `payment_intent.succeeded` redelivered (idempotent) | 200  | Already recorded, must not double-process |
+| `payment_intent.payment_failed` processed         | 200    | Pending row cancelled |
+| Event type we don't handle (e.g. `charge.updated`) | 200   | Stripe delivers all enabled events; non-2xx = infinite retry |
+| PaymentIntent id maps to no subscription in our DB | 200   | Data-integrity signal (logged); Stripe can't fix it by retrying |
+| Unexpected error (DB down, etc.)                  | 500    | We WANT Stripe to retry a genuine failure |
+
+### End-to-end test with the Stripe CLI
+
+Prereqs (one-time): `brew install stripe/stripe-cli/stripe && stripe login`.
+
+Three terminals.
+
+**Terminal A — Stripe → local webhook forwarder:**
+
+```bash
+stripe listen --forward-to localhost:8080/webhooks/stripe
+# Copy the `whsec_...` it prints into .env's STRIPE_WEBHOOK_SECRET
+```
+
+**Terminal B — the API:**
+
+```bash
+set -a; source .env; set +a
+go run ./cmd/api
+# Verify the startup fingerprint matches Terminal A's whsec:
+#   stripe: SECRET_KEY=sk_test_...  WEBHOOK_SECRET=whsec_6a4889...
+```
+
+**Terminal C — the flow:**
+
+```bash
+set -a; source .env; set +a
+
+TOKEN=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq -r .token)
+
+# Create the pending sub + PaymentIntent
+RESP=$(curl -s -X POST localhost:8080/subscriptions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"creator_id":1,"plan":"monthly"}')
+echo "$RESP" | jq
+PI=$(echo "$RESP" | jq -r .subscription.payment_intent_id)
+
+# Confirm the payment — this triggers payment_intent.succeeded to our webhook
+stripe payment_intents confirm "$PI" --payment-method pm_card_visa >/dev/null
+
+# Verify: subscription flipped to active, one transaction row written
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "SELECT id, status, payment_intent_id FROM subscriptions WHERE user_id=1 AND creator_id=1 ORDER BY id DESC LIMIT 1;"
+# → status = active
+
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "SELECT subscription_id, amount, status, stripe_event_id FROM transactions ORDER BY id DESC LIMIT 1;"
+# → one row with amount=4.99, status=succeeded, stripe_event_id=evt_...
+```
+
+Expected Terminal B log during the confirm:
+
+```
+webhook: ignoring event unhandled (id=evt_...)               ← payment_intent.created
+webhook: payment_intent.succeeded processed pi=pi_... event=evt_... sub=N
+notifications: would notify creator=1 about subscribed of subscription=N (user=1)
+webhook: ignoring event unhandled (id=evt_...)               ← charge.succeeded
+webhook: ignoring event unhandled (id=evt_...)               ← charge.updated
+```
+
+**Prove the redelivery guarantee:** grab the `payment_intent.succeeded`
+event id from Terminal A's log (or `stripe events list`) and:
+
+```bash
+stripe events resend evt_...
+```
+
+Terminal B:
+```
+webhook: payment_intent.succeeded already processed event=evt_... (idempotent ack)
+```
+
+DB:
+```bash
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "SELECT COUNT(*) FROM transactions WHERE stripe_event_id='evt_...';"
+# → 1 (not 2 — the redelivery was rejected by the partial UNIQUE index)
+```
+
+No second `notifications: would notify` line — the creator was notified
+exactly once even though the webhook fired twice.
+
+### Documented gaps
+
+- **`IgnoreAPIVersionMismatch=true`** in webhook verification. `stripe-go
+  v79.12.0` expects API version 2024-06-20; local Stripe account is on
+  2023-10-16. Safe because we only read `event.ID` and
+  `data.object.id` — unchanged between those versions. **To remove:**
+  upgrade the account API version in the Stripe dashboard, then delete
+  the option.
+- **`AllowRedirects="never"`** on PaymentIntent creation. Excludes EU
+  bank redirects (iDEAL, Sofort, etc.), most BNPL redirect flows, and
+  redirect-based 3-D Secure step-ups. Needed because there's no
+  frontend to supply a `return_url` on confirm or render the
+  post-redirect landing page. **To remove:** build a frontend that
+  handles `return_url`, then flip back to Stripe's default.
+- **`PaymentAmountCents = 499`** hardcoded in the webhook handler
+  instead of reading `amount` from the event payload. Fine for one
+  plan; fix when we add a second plan or promo codes.
+- **No frontend, so `stripe.confirmPayment` is emulated via
+  `stripe payment_intents confirm --payment-method pm_card_visa`.** For
+  a real client, `client_secret` goes to Stripe.js and everything past
+  the `client_secret` return is client-side.
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
@@ -676,8 +917,8 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 3 — Background worker that expires overdue subscriptions on a ticker~~ ✅
 - ~~Phase 4 — In-process notification queue (channel), later swapped for SQS~~ ✅
 - ~~Phase 5 — JWT auth middleware + ownership checks~~ ✅
-- Phase 6 — Automated tests (unit tests for services with a fake repo, integration tests for the repository against real Postgres)
-- Phase 7 — Stripe sandbox payments + webhooks
+- ~~Phase 6 — Automated tests (service unit tests + repository integration tests)~~ ✅
+- ~~Phase 7 — Stripe sandbox payments + webhooks (pending-until-paid, idempotent)~~ ✅
 - Phase 8 — Rate limiting
 - Phase 9 — Metrics endpoint
 - Phase 10 — GitHub Actions CI/CD

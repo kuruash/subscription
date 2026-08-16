@@ -22,6 +22,15 @@ import (
 var ErrDuplicateActive = errors.New("active subscription already exists for this user and creator")
 var ErrNotFound = errors.New("subscription not found")
 
+// ErrDuplicateEvent is returned by MarkPaymentSucceeded when the same
+// Stripe event id has already produced a transaction row. This is the
+// idempotency path — Stripe retries webhook deliveries on any non-2xx,
+// so a duplicate delivery must fail the INSERT (via the partial UNIQUE
+// index on stripe_event_id) and get translated into a 200 OK upstream
+// so Stripe stops retrying. Distinct from ErrDuplicateActive so the
+// handler knows *why* the insert failed.
+var ErrDuplicateEvent = errors.New("stripe event already processed")
+
 // ExpiredSub is what ExpireOverdue returns per row: enough for the caller
 // to invalidate the affected user's cache AND publish a notification
 // event without a second lookup.
@@ -36,7 +45,28 @@ type ExpiredSub struct {
 // no `implements` keyword, no explicit declaration. This is called
 // structural / duck typing.
 type SubscriptionRepository interface {
-	Create(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error)
+	// CreatePending inserts a subscription row in 'pending' state with the
+	// caller-supplied PaymentIntentID. No transaction row is written — the
+	// transaction only exists once Stripe confirms the payment via webhook.
+	// Returns ErrDuplicateActive if the partial unique index rejects this
+	// as a duplicate active-or-pending row for (user_id, creator_id).
+	CreatePending(ctx context.Context, sub *models.Subscription) (*models.Subscription, error)
+
+	// MarkPaymentSucceeded is called from the Stripe webhook path when we
+	// receive payment_intent.succeeded. It atomically:
+	//   1. Inserts a transactions row tagged with stripe_event_id — the
+	//      partial UNIQUE index makes duplicate deliveries fail here.
+	//   2. Flips the matching subscription from 'pending' to 'active'.
+	// Returns ErrDuplicateEvent if the event was already processed (safe
+	// to translate into 200 OK for Stripe). Returns ErrNotFound if no
+	// subscription exists for the given PaymentIntent id.
+	MarkPaymentSucceeded(ctx context.Context, paymentIntentID, stripeEventID string, amountCents int64) (*models.Subscription, error)
+
+	// MarkPaymentFailed cancels the pending subscription for a
+	// PaymentIntent. Cancelling (not deleting) so the row's history is
+	// preserved and the partial unique index no longer blocks re-subscribe.
+	MarkPaymentFailed(ctx context.Context, paymentIntentID string) (*models.Subscription, error)
+
 	GetByID(ctx context.Context, id int) (*models.Subscription, error)
 	ListByUser(ctx context.Context, userID int) ([]models.Subscription, error)
 	// Cancel returns the affected subscription's user_id so callers can
@@ -65,40 +95,27 @@ func NewPostgresRepo(db *sql.DB) SubscriptionRepository {
 	return &postgresRepo{db: db}
 }
 
-// Create inserts the subscription AND its initial transaction row atomically.
-// Either both succeed or both roll back — no half-written state.
-func (r *postgresRepo) Create(ctx context.Context, sub *models.Subscription, amount float64) (*models.Subscription, error) {
-	// BeginTx starts a SQL transaction. The `ctx` here means "if the caller
-	// cancels (e.g. the HTTP client disconnects), abort this DB work too."
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	// THE DEFER ROLLBACK PATTERN:
-	// `defer` runs this line when the function returns, for ANY reason
-	// (normal return, error return, panic). We schedule a Rollback right
-	// away so that if we return early on an error below, cleanup happens
-	// automatically.
-	// If we successfully Commit() further down, the Rollback becomes a
-	// no-op — Postgres just says "transaction already finished" and it's
-	// safe. So this is not a bug; it's the standard "always clean up,
-	// commit is the exception" idiom.
-	defer tx.Rollback()
-
+// CreatePending inserts a subscription in 'pending' state.
+//
+// No transactions row is written here — a transaction row means "money
+// moved" and money has not moved yet. Only the Stripe webhook path,
+// through MarkPaymentSucceeded, is allowed to write to transactions in
+// Phase 7. Keeping this rule crisp is what makes the
+// transactions.stripe_event_id UNIQUE constraint a meaningful idempotency
+// key: if there's a transaction row, we processed a Stripe event; if
+// there isn't, we didn't.
+func (r *postgresRepo) CreatePending(ctx context.Context, sub *models.Subscription) (*models.Subscription, error) {
 	now := time.Now().UTC()
 	sub.StartDate = now
 	sub.ExpiresAt = now.Add(30 * 24 * time.Hour)
-	sub.Status = models.StatusActive
+	sub.Status = models.StatusPending
 
-	// QueryRowContext with RETURNING gets the DB-assigned id + created_at
-	// back in the same round trip. Scan() reads the returned columns into
-	// the pointers you pass.
-	// payment_intent_id is included in the column list even when nil so this
-	// same statement works for the old ("insert as active immediately")
-	// and new Phase-7 ("insert as pending with a PI attached") call paths
-	// without needing two variants of the INSERT. lib/pq turns a nil
-	// *string into SQL NULL for us.
-	err = tx.QueryRowContext(ctx, `
+	// Single-statement INSERT — no BEGIN/COMMIT needed since there's
+	// only one write. The partial unique index on (user_id, creator_id)
+	// WHERE status IN ('active','pending') is what prevents two
+	// concurrent Subscribe calls from producing two pending rows for
+	// the same pair; one wins, the other gets 23505 → ErrDuplicateActive.
+	err := r.db.QueryRowContext(ctx, `
 		INSERT INTO subscriptions
 		    (user_id, creator_id, plan, status, start_date, expires_at, auto_renew, payment_intent_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -108,35 +125,131 @@ func (r *postgresRepo) Create(ctx context.Context, sub *models.Subscription, amo
 	).Scan(&sub.ID, &sub.CreatedAt)
 
 	if err != nil {
-		// Translate the Postgres-specific unique-violation code (23505)
-		// into our sentinel error. The service/handler layers never need
-		// to know pq exists.
 		var pqErr *pq.Error
 		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
 			return nil, ErrDuplicateActive
 		}
-		return nil, fmt.Errorf("insert subscription: %w", err)
+		return nil, fmt.Errorf("create pending subscription: %w", err)
+	}
+	return sub, nil
+}
+
+// MarkPaymentSucceeded flips pending → active AND records the payment.
+//
+// IDEMPOTENCY:
+// The order matters. We INSERT the transaction row (which carries
+// stripe_event_id) BEFORE the UPDATE. If Stripe redelivers the same
+// event, the INSERT fails with 23505 — the partial UNIQUE index on
+// stripe_event_id catches it — and we return ErrDuplicateEvent. The
+// caller (webhook handler) translates that into 200 OK so Stripe stops
+// retrying an event we've already handled.
+//
+// Doing INSERT first means "we recorded processing this event" is the
+// atomic gate. If we UPDATE'd first and then INSERT'd, a redelivery
+// would UPDATE a no-op (pending is already active), then fail the
+// INSERT — same outcome, but the state machine is harder to reason
+// about because "row is active" isn't equivalent to "event was recorded."
+//
+// UPDATE-returns-0-rows case: the subscription exists but isn't pending
+// (e.g. it was cancelled between PI creation and confirmation). We
+// deliberately DO NOT resurrect a cancelled row. The transaction row
+// still gets committed — that's the money-movement record for
+// reconciliation later. Callers see the row's current status in the
+// returned struct.
+func (r *postgresRepo) MarkPaymentSucceeded(ctx context.Context, paymentIntentID, stripeEventID string, amountCents int64) (*models.Subscription, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Find the subscription this PaymentIntent belongs to. We fail
+	//    fast with ErrNotFound if it's missing — a payment for a
+	//    subscription we don't know about is a data-integrity signal,
+	//    not a business event to process.
+	var s models.Subscription
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, user_id, creator_id, plan, status, payment_intent_id,
+		       start_date, expires_at, auto_renew, created_at
+		FROM subscriptions
+		WHERE payment_intent_id = $1
+	`, paymentIntentID).Scan(
+		&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
+		&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup by payment intent: %w", err)
 	}
 
-	// Second write in the same transaction — the payment record.
-	// stripe_event_id is left as SQL default NULL here: this pre-Phase-7
-	// code path doesn't have a Stripe event yet. The Phase 7 webhook
-	// handler is what will INSERT transactions with a non-null
-	// stripe_event_id and rely on the partial UNIQUE index for
-	// idempotency. Leaving the column out of this INSERT (rather than
-	// passing an explicit NULL) keeps that intent visible.
+	// 2. Insert the transaction row. The stripe_event_id UNIQUE index
+	//    is the idempotency gate.
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO transactions (subscription_id, amount, currency, status)
-		VALUES ($1, $2, 'usd', $3)
-	`, sub.ID, amount, models.TxStatusSucceeded)
+		INSERT INTO transactions (subscription_id, amount, currency, status, stripe_event_id)
+		VALUES ($1, $2, 'usd', $3, $4)
+	`, s.ID, float64(amountCents)/100.0, models.TxStatusSucceeded, stripeEventID)
 	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			return nil, ErrDuplicateEvent
+		}
 		return nil, fmt.Errorf("insert transaction: %w", err)
 	}
+
+	// 3. Flip pending → active. Guarded by status='pending' so a
+	//    cancelled row isn't accidentally reactivated.
+	var newStatus string
+	err = tx.QueryRowContext(ctx, `
+		UPDATE subscriptions SET status = $1
+		WHERE id = $2 AND status = $3
+		RETURNING status
+	`, models.StatusActive, s.ID, models.StatusPending).Scan(&newStatus)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("update subscription: %w", err)
+	}
+	if err == nil {
+		s.Status = newStatus
+	}
+	// If sql.ErrNoRows: the row exists but wasn't pending. Commit the
+	// transaction row anyway; caller sees the row in whatever state it
+	// was actually in via s.Status.
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return sub, nil
+	return &s, nil
+}
+
+// MarkPaymentFailed cancels a pending subscription when Stripe reports
+// payment_intent.payment_failed. Cancel (soft), don't delete: preserves
+// the row's history, keeps the partial unique index from being upset
+// (cancelled rows are excluded from it, so the user can re-subscribe),
+// and matches the "never hard delete" project rule.
+//
+// Returns ErrNotFound if there's no pending row for this PaymentIntent
+// (e.g. the user already cancelled, or the payment_succeeded webhook
+// beat this one). That's not an error condition worth retrying — the
+// caller should ack 200 to Stripe.
+func (r *postgresRepo) MarkPaymentFailed(ctx context.Context, paymentIntentID string) (*models.Subscription, error) {
+	var s models.Subscription
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE subscriptions SET status = $1
+		WHERE payment_intent_id = $2 AND status = $3
+		RETURNING id, user_id, creator_id, plan, status, payment_intent_id,
+		          start_date, expires_at, auto_renew, created_at
+	`, models.StatusCancelled, paymentIntentID, models.StatusPending).Scan(
+		&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
+		&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mark payment failed: %w", err)
+	}
+	return &s, nil
 }
 
 func (r *postgresRepo) GetByID(ctx context.Context, id int) (*models.Subscription, error) {

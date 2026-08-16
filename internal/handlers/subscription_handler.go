@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"subscription-service/internal/middleware"
+	"subscription-service/internal/models"
 	"subscription-service/internal/services"
 )
 
@@ -32,34 +33,50 @@ func NewSubscriptionHandler(svc *services.SubscriptionService) *SubscriptionHand
 // the group before passing it in — that keeps auth policy visible at
 // the composition site instead of hidden inside each handler.
 func (h *SubscriptionHandler) Register(rg *gin.RouterGroup) {
-	rg.POST("/subscriptions", h.create)
+	rg.POST("/subscriptions", h.subscribe)
 	rg.GET("/subscriptions/:id", h.get)
 	rg.DELETE("/subscriptions/:id", h.cancel)
 	rg.POST("/subscriptions/:id/renew", h.renew)
 	rg.GET("/users/:id/subscriptions", h.listByUser)
 }
 
-type createRequest struct {
+type subscribeRequest struct {
 	CreatorID int    `json:"creator_id" binding:"required"`
 	Plan      string `json:"plan"       binding:"required"`
 }
 
-// create: the authenticated user is subscribing themselves — the user_id
+// subscribeResponse wraps the pending subscription plus the Stripe
+// client_secret. Nested (rather than flattening client_secret into the
+// Subscription struct) because client_secret is a payment-initiation
+// artifact, not a property of the subscription itself — it doesn't
+// exist on the row in the DB and won't show up on subsequent GETs.
+// Nesting keeps that distinction visible in the API shape.
+type subscribeResponse struct {
+	Subscription *models.Subscription `json:"subscription"`
+	ClientSecret string               `json:"client_secret"`
+}
+
+// subscribe: the authenticated user is subscribing themselves — the user_id
 // comes from the JWT, NOT the body. Letting the body pick user_id would
 // let anyone subscribe on behalf of anyone else, defeating the whole
 // point of the token.
-func (h *SubscriptionHandler) create(c *gin.Context) {
+//
+// Phase 7 change: the row is created in 'pending' state and the response
+// includes the client_secret so the frontend can confirm the payment
+// with Stripe.js. The subscription only becomes 'active' once Stripe
+// pings /webhooks/stripe with payment_intent.succeeded — see file 6.
+func (h *SubscriptionHandler) subscribe(c *gin.Context) {
 	authUserID, ok := middleware.UserIDFrom(c.Request.Context())
 	if !ok {
 		writeError(c, services.ErrForbidden)
 		return
 	}
-	var req createRequest
+	var req subscribeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	sub, err := h.svc.Create(c.Request.Context(), services.CreateInput{
+	sub, clientSecret, err := h.svc.Subscribe(c.Request.Context(), services.SubscribeInput{
 		UserID:    authUserID,
 		CreatorID: req.CreatorID,
 		Plan:      req.Plan,
@@ -68,7 +85,14 @@ func (h *SubscriptionHandler) create(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, sub)
+	// 201 Created — the pending row exists. The payment hasn't succeeded
+	// yet, but a resource *was* created; 202 Accepted would also be
+	// defensible but 201 is the closer match to prior semantics and
+	// what most Stripe-integrated APIs return here.
+	c.JSON(http.StatusCreated, subscribeResponse{
+		Subscription: sub,
+		ClientSecret: clientSecret,
+	})
 }
 
 func (h *SubscriptionHandler) get(c *gin.Context) {

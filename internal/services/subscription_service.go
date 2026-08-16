@@ -27,13 +27,18 @@ import (
 	"subscription-service/internal/cache"
 	"subscription-service/internal/models"
 	"subscription-service/internal/notifications"
+	"subscription-service/internal/payments"
 	"subscription-service/internal/repository"
 )
 
 var (
 	ErrDuplicateActive = repository.ErrDuplicateActive
 	ErrNotFound        = repository.ErrNotFound
-	ErrInvalidInput    = errors.New("invalid input")
+	// ErrDuplicateEvent surfaces the repo-level idempotency sentinel to
+	// the webhook handler under the service package's error namespace, so
+	// handlers only ever import services (not repository) for error checks.
+	ErrDuplicateEvent = repository.ErrDuplicateEvent
+	ErrInvalidInput   = errors.New("invalid input")
 	// ErrForbidden = "the subscription exists, but this authenticated user
 	// doesn't own it." Deliberately distinct from ErrNotFound so handlers
 	// can return 403 vs 404 correctly. See README for the info-leak tradeoff.
@@ -57,17 +62,26 @@ type SubscriptionService struct {
 	repo      repository.SubscriptionRepository
 	rdb       *redis.Client
 	publisher notifications.Publisher
+	// payments is the Stripe wrapper (interface, not the SDK) — see
+	// internal/payments. We hold the interface, not a concrete client, so
+	// tests can inject a fake without a Stripe API key or network access.
+	payments payments.Client
 }
 
 func NewSubscriptionService(
 	repo repository.SubscriptionRepository,
 	rdb *redis.Client,
 	publisher notifications.Publisher,
+	pay payments.Client,
 ) *SubscriptionService {
-	return &SubscriptionService{repo: repo, rdb: rdb, publisher: publisher}
+	return &SubscriptionService{repo: repo, rdb: rdb, publisher: publisher, payments: pay}
 }
 
-type CreateInput struct {
+// SubscribeInput is the same shape as the old CreateInput — renamed
+// because "Create" now sounds like "already-active"; Subscribe reflects
+// the Phase-7 flow where the row starts pending and only becomes active
+// once Stripe confirms.
+type SubscribeInput struct {
 	UserID    int
 	CreatorID int
 	Plan      string
@@ -78,35 +92,130 @@ type CreateInput struct {
 
 // -------- writes: mutate DB, then invalidate the affected user's cache --------
 
-func (s *SubscriptionService) Create(ctx context.Context, in CreateInput) (*models.Subscription, error) {
+// Subscribe kicks off a Phase-7 pending subscription.
+//
+// Flow:
+//  1. Ask Stripe to create a PaymentIntent for the plan price.
+//  2. Insert a subscription row in 'pending' state, tagged with the
+//     PaymentIntent id.
+//  3. Return (sub, client_secret, nil) — the client uses client_secret
+//     with Stripe.js to actually confirm the payment.
+//
+// We do NOT publish EventSubscribed here. That event means "a user
+// actively subscribed and paid," which we cannot claim until the
+// payment_intent.succeeded webhook confirms the charge. See
+// MarkPaymentSucceeded — that's the only place EventSubscribed is
+// published in Phase 7.
+//
+// ORDERING CHOICE — Stripe first, then DB:
+// I create the PaymentIntent BEFORE the DB row. Rationale:
+//   - If the DB write fails, we leak an orphan PaymentIntent in Stripe.
+//     Stripe auto-expires abandoned PIs after ~24h; the failure mode is
+//     bounded and self-cleaning.
+//   - The reverse order (DB first, PI second) leaves an orphan pending
+//     row that the partial unique index would then block re-subscribe on
+//     until we cleaned it up manually. Worse UX for a worse failure.
+//   - Also: a single-write DB path is easier to reason about than
+//     "insert + then update payment_intent_id if PI succeeds."
+func (s *SubscriptionService) Subscribe(ctx context.Context, in SubscribeInput) (*models.Subscription, string, error) {
 	if in.UserID <= 0 || in.CreatorID <= 0 {
-		return nil, fmt.Errorf("%w: user_id and creator_id must be positive", ErrInvalidInput)
+		return nil, "", fmt.Errorf("%w: user_id and creator_id must be positive", ErrInvalidInput)
 	}
 	price, ok := planPrices[in.Plan]
 	if !ok {
-		return nil, fmt.Errorf("%w: unknown plan %q", ErrInvalidInput, in.Plan)
+		return nil, "", fmt.Errorf("%w: unknown plan %q", ErrInvalidInput, in.Plan)
 	}
 
-	sub := &models.Subscription{
-		UserID:    in.UserID,
-		CreatorID: in.CreatorID,
-		Plan:      in.Plan,
-		AutoRenew: true,
+	// Convert dollars → cents ONCE at the boundary. Stripe's API and our
+	// payments interface both take int64 cents; the internal price table
+	// stays in dollars for readability.
+	amountCents := int64(price * 100)
+
+	pi, err := s.payments.CreatePaymentIntent(ctx, amountCents, "usd", map[string]string{
+		// Purely informational — surfaces in the Stripe dashboard so a
+		// human debugging a stuck payment can trace it back to our
+		// domain. NOT used as a lookup key; the webhook path looks up by
+		// payment_intent_id, which is authoritative.
+		"user_id":    fmt.Sprintf("%d", in.UserID),
+		"creator_id": fmt.Sprintf("%d", in.CreatorID),
+		"plan":       in.Plan,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("create payment intent: %w", err)
 	}
-	created, err := s.repo.Create(ctx, sub, price)
+
+	// Attach the PI id to the sub before insert. lib/pq turns a non-nil
+	// *string into a real value, nil into SQL NULL — see models.Subscription.
+	sub := &models.Subscription{
+		UserID:          in.UserID,
+		CreatorID:       in.CreatorID,
+		Plan:            in.Plan,
+		AutoRenew:       true,
+		PaymentIntentID: &pi.ID,
+	}
+	created, err := s.repo.CreatePending(ctx, sub)
+	if err != nil {
+		// DB write failed. The PaymentIntent (pi.ID) will linger in
+		// Stripe and eventually auto-expire; we log for observability but
+		// don't try to cancel it here — a Stripe cancel is itself a
+		// network call that could fail, and the auto-expiry is the more
+		// reliable cleanup path.
+		log.Printf("Subscribe: DB CreatePending failed after Stripe PI %s created: %v", pi.ID, err)
+		return nil, "", err
+	}
+	// Invalidate cache — the new pending row belongs in this user's
+	// list. (ListByUser returns all statuses.)
+	s.invalidateUserList(ctx, created.UserID)
+
+	return created, pi.ClientSecret, nil
+}
+
+// MarkPaymentSucceeded is called from the Stripe webhook handler ONLY.
+// Never call this from any user-facing code path — Stripe events are
+// the sole authority for "money moved," and gating on that in this
+// service (rather than a handler) keeps the invariant enforced by
+// composition, not convention.
+//
+// This method owns the post-repo side effects: cache invalidation, then
+// publishing EventSubscribed. Both happen only when the repo call
+// actually reports a state change; ErrDuplicateEvent (repeat webhook
+// delivery) short-circuits before the publish so a creator isn't
+// notified twice for the same subscribe.
+func (s *SubscriptionService) MarkPaymentSucceeded(ctx context.Context, paymentIntentID, stripeEventID string, amountCents int64) (*models.Subscription, error) {
+	sub, err := s.repo.MarkPaymentSucceeded(ctx, paymentIntentID, stripeEventID, amountCents)
+	if err != nil {
+		// ErrDuplicateEvent / ErrNotFound both flow through unchanged;
+		// the webhook handler decides what to do with them (both should
+		// end up as 2xx to Stripe so the retry loop stops).
+		return nil, err
+	}
+	s.invalidateUserList(ctx, sub.UserID)
+	// Publish AFTER the commit AND after cache invalidation. The event
+	// only fires when we successfully flipped pending → active on a
+	// fresh event, so creators are notified exactly once per successful
+	// subscribe (idempotency at the notification layer comes for free
+	// from the DB-level idempotency in MarkPaymentSucceeded).
+	s.publisher.Publish(notifications.Event{
+		SubscriptionID: sub.ID,
+		UserID:         sub.UserID,
+		CreatorID:      sub.CreatorID,
+		Type:           notifications.EventSubscribed,
+	})
+	return sub, nil
+}
+
+// MarkPaymentFailed is also webhook-only. Cancels the pending row so
+// the user can retry Subscribe (the partial unique index excludes
+// cancelled rows). No notification is published — nothing happened from
+// the creator's point of view; a failed payment attempt isn't a
+// business event they care about.
+func (s *SubscriptionService) MarkPaymentFailed(ctx context.Context, paymentIntentID string) (*models.Subscription, error) {
+	sub, err := s.repo.MarkPaymentFailed(ctx, paymentIntentID)
 	if err != nil {
 		return nil, err
 	}
-	s.invalidateUserList(ctx, created.UserID)
-	// Publish AFTER the commit. Publishing before would let us emit a
-	// "subscribed" event for a row that ended up not existing.
-	s.publisher.Publish(notifications.Event{
-		SubscriptionID: created.ID,
-		UserID:         created.UserID,
-		CreatorID:      created.CreatorID,
-		Type:           notifications.EventSubscribed,
-	})
-	return created, nil
+	s.invalidateUserList(ctx, sub.UserID)
+	return sub, nil
 }
 
 func (s *SubscriptionService) Get(ctx context.Context, id int) (*models.Subscription, error) {

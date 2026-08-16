@@ -79,7 +79,12 @@ func main() {
 	notifQueue := notifications.NewQueue(128)
 
 	repo := repository.NewPostgresRepo(db)
-	svc := services.NewSubscriptionService(repo, rdb, notifQueue)
+	// The worker only calls ExpireOverdue, never Subscribe or the two
+	// webhook-only Mark* methods, so it has no reason to hold a Stripe
+	// client. Passing nil is safe as long as that invariant holds — a nil
+	// interface will panic if actually invoked, which is louder than a
+	// silent noop and easier to catch if someone regresses this.
+	svc := services.NewSubscriptionService(repo, rdb, notifQueue, nil)
 
 	// A context that we can cancel on SIGINT/SIGTERM so an in-flight sweep
 	// aborts cleanly instead of being killed mid-UPDATE.

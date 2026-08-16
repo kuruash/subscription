@@ -105,16 +105,53 @@ func NewClient(apiKey, webhookSecret string) Client {
 // bug waiting to happen (4.99 is not representable exactly in binary
 // float). Stripe's API takes cents, and we match. Callers convert once
 // at the boundary (e.g. int64(4.99 * 100) = 499).
+//
+// AllowRedirects="never" (set in AutomaticPaymentMethods below):
+// We deliberately exclude redirect-based payment methods. Rationale:
+// Stripe's default behavior for automatic_payment_methods enables
+// redirect flows (bank redirects like iDEAL/Sofort/Bancontact, some
+// wallets, and certain 3-D-Secure card confirmations). Redirects
+// require a return_url on confirm — the user is bounced off Stripe,
+// authenticates on their bank's page, and gets sent back. That entire
+// flow needs a frontend to (a) supply return_url when confirming and
+// (b) handle the post-redirect landing page.
+//
+// We don't have that frontend yet — this is a bare backend API — and
+// forcing a return_url through a curl / Stripe-CLI test would make
+// the sandbox flow much harder to demonstrate. "never" restricts
+// PaymentIntents to methods that confirm synchronously in one round
+// trip (basic card charges, Apple/Google Pay tokens, etc.).
+//
+// EXCLUDED payment methods with AllowRedirects="never":
+//   - EU bank redirects: iDEAL (NL), Sofort (DE/AT), Bancontact (BE),
+//     giropay (DE), EPS (AT), P24 (PL). Big deal in Europe, near-zero
+//     usage in a US-first sandbox.
+//   - Buy-now-pay-later redirect flows: Klarna, Afterpay/Clearpay,
+//     Affirm (when they route via their own auth page).
+//   - Redirect-authenticated wallets: Alipay, WeChat Pay, some
+//     WalletConnect flows.
+//   - Redirect-based 3-D-Secure step-ups on cards. Note: modern 3DS2
+//     usually resolves without a full redirect (device fingerprinting
+//     or in-frame challenge), so most card confirmations still work.
+//     A card that HARD-requires a redirect challenge will fail.
+//
+// Why this is a documented gap, not a production choice:
+//   - A real product serving European users would leave redirects on
+//     and build the frontend redirect-return flow. Losing iDEAL alone
+//     would be commercially unacceptable in the Netherlands.
+//   - The right fix is a frontend, not a Stripe config change. This
+//     setting will flip back to Stripe's default the moment we add a
+//     browser client that handles return_url properly.
 func (c *stripeClient) CreatePaymentIntent(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*PaymentIntent, error) {
 	params := &stripe.PaymentIntentParams{
 		Amount:   stripe.Int64(amountCents),
 		Currency: stripe.String(currency),
 		// AutomaticPaymentMethods lets Stripe pick whatever payment methods
-		// are enabled on the account — cards, wallets, etc. Simplest thing
-		// that works for a sandbox; a real product might pin specific
-		// methods per market.
+		// are enabled on the account, but we set AllowRedirects="never" —
+		// see the doc note above CreatePaymentIntent for the tradeoff.
 		AutomaticPaymentMethods: &stripe.PaymentIntentAutomaticPaymentMethodsParams{
-			Enabled: stripe.Bool(true),
+			Enabled:        stripe.Bool(true),
+			AllowRedirects: stripe.String("never"),
 		},
 	}
 	// stripe.Params.Metadata is a map[string]string that flows through to
@@ -150,7 +187,21 @@ func (c *stripeClient) CreatePaymentIntent(ctx context.Context, amountCents int6
 // bad we return our sentinel ErrInvalidSignature so the handler can
 // return 400 without leaking anything about why.
 func (c *stripeClient) VerifyWebhookSignature(payload []byte, sigHeader string) (*Event, error) {
-	stripeEvent, err := webhook.ConstructEvent(payload, sigHeader, c.webhookSecret)
+	// IgnoreAPIVersionMismatch=true: the Stripe SDK we pin (stripe-go
+	// v79) expects API version 2024-06-20, but a Stripe account may
+	// still be on an older version (e.g. 2023-10-16, which is what
+	// `stripe listen` prints). By default the SDK refuses to verify
+	// events from an older API version to guard against silent
+	// deserialization drift.
+	//
+	// Safe for us because we read only two fields (event.ID and
+	// event.Data.Object["id"]) whose shape and semantics have not
+	// changed between the two API versions. The right long-term fix
+	// is to upgrade the account's API version in the Stripe dashboard
+	// so this fallback becomes unnecessary.
+	stripeEvent, err := webhook.ConstructEventWithOptions(payload, sigHeader, c.webhookSecret, webhook.ConstructEventOptions{
+		IgnoreAPIVersionMismatch: true,
+	})
 	if err != nil {
 		// Log the specific reason once we have proper logging; for now
 		// collapse all signature failures into one sentinel because a
