@@ -52,6 +52,11 @@ type fakeRepo struct {
 	CancelFn               func(ctx context.Context, id int) (int, error)
 	RenewFn                func(ctx context.Context, id int) (*models.Subscription, error)
 	ExpireOverdueFn        func(ctx context.Context) ([]repository.ExpiredSub, error)
+	// Phase 11 additions — not exercised by any test yet, so unset
+	// fields will panic with "unexpected call" if a test accidentally
+	// hits them.
+	ListAllFn func(ctx context.Context, limit, offset int) ([]models.Subscription, error)
+	StatsFn   func(ctx context.Context) (repository.AdminStats, error)
 }
 
 func (f *fakeRepo) CreatePending(ctx context.Context, sub *models.Subscription) (*models.Subscription, error) {
@@ -101,6 +106,18 @@ func (f *fakeRepo) ExpireOverdue(ctx context.Context) ([]repository.ExpiredSub, 
 		return nil, errors.New("fakeRepo.ExpireOverdue: unexpected call")
 	}
 	return f.ExpireOverdueFn(ctx)
+}
+func (f *fakeRepo) ListAll(ctx context.Context, limit, offset int) ([]models.Subscription, error) {
+	if f.ListAllFn == nil {
+		return nil, errors.New("fakeRepo.ListAll: unexpected call")
+	}
+	return f.ListAllFn(ctx, limit, offset)
+}
+func (f *fakeRepo) Stats(ctx context.Context) (repository.AdminStats, error) {
+	if f.StatsFn == nil {
+		return repository.AdminStats{}, errors.New("fakeRepo.Stats: unexpected call")
+	}
+	return f.StatsFn(ctx)
 }
 
 // fakePayments satisfies payments.Client via per-method function

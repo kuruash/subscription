@@ -340,6 +340,23 @@ func (s *SubscriptionService) ListByUser(ctx context.Context, userID int) ([]mod
 	return subs, nil
 }
 
+// -------- Phase 11: admin dashboard --------
+//
+// These two are thin proxies to the repo — no cache, no notifications,
+// no business logic. Kept on the service (rather than having handlers
+// go direct to the repo) so the layering rule stays consistent:
+// handlers only depend on services. Also gives future admin-only
+// business logic (auditing, permission scoping) a place to land
+// without a handler refactor.
+
+func (s *SubscriptionService) ListAll(ctx context.Context, limit, offset int) ([]models.Subscription, error) {
+	return s.repo.ListAll(ctx, limit, offset)
+}
+
+func (s *SubscriptionService) Stats(ctx context.Context) (repository.AdminStats, error) {
+	return s.repo.Stats(ctx)
+}
+
 // ExpireOverdue runs the DB sweep and invalidates one Redis key per
 // affected user. Called by the background worker on a ticker.
 //

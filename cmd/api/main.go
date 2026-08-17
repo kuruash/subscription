@@ -134,7 +134,10 @@ func main() {
 	repo := repository.NewPostgresRepo(db)
 	svc := services.NewSubscriptionService(repo, rdb, notifQueue, payClient)
 	subH := handlers.NewSubscriptionHandler(svc)
-	authH := handlers.NewAuthHandler(jwtSecret)
+	// Phase 11: auth handler now needs the DB to look up the user's
+	// role at /login time and bake it into the JWT.
+	authH := handlers.NewAuthHandler(jwtSecret, db)
+	adminH := handlers.NewAdminHandler(svc)
 
 	r := gin.Default()
 
@@ -247,6 +250,20 @@ func main() {
 	// (RequireAuth, subLimiter) is the correct order.
 	protected := r.Group("", middleware.RequireAuth(jwtSecret), subLimiter.Handler())
 	subH.Register(protected)
+
+	// --- Admin routes (Phase 11) ---
+	//
+	// MIDDLEWARE ORDER: RequireAuth → RequireAdmin. Both required, both
+	// on the SAME group so any future admin route added inherits them.
+	// The order matters (auth stashes the role that RequireAdmin reads);
+	// see internal/middleware/requireadmin.go for the full explanation.
+	//
+	// Not rate-limited separately from the user limiter — admin traffic
+	// is low-QPS from a UI or CSV export, and admins already pay the
+	// per-user 60/min bucket via `subLimiter`. If admin routes ever
+	// serve a script-driven workload we'll want their own bucket.
+	admin := r.Group("", middleware.RequireAuth(jwtSecret), middleware.RequireAdmin(), subLimiter.Handler())
+	adminH.Register(admin)
 
 	// --- Active-subscriptions gauge updater (Phase 9) ---
 	//
