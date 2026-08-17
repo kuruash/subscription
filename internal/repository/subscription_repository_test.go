@@ -63,6 +63,7 @@ func TestMain(m *testing.M) {
 		tcpostgres.WithInitScripts(
 			"../../migrations/001_init.sql",
 			"../../migrations/002_add_pending_status.sql",
+			"../../migrations/003_add_role_and_status_changed_at.sql",
 		),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").

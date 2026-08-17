@@ -80,6 +80,25 @@ type SubscriptionRepository interface {
 	// to call as often as you want — running it on already-expired rows
 	// is a no-op (see IDEMPOTENCY note on the implementation).
 	ExpireOverdue(ctx context.Context) ([]ExpiredSub, error)
+
+	// ListAll returns a page of ALL subscriptions across all users,
+	// ordered by created_at DESC. Phase 11 admin endpoint. See the
+	// implementation for the OFFSET-vs-cursor pagination tradeoff.
+	ListAll(ctx context.Context, limit, offset int) ([]models.Subscription, error)
+
+	// Stats returns aggregate counts for the admin dashboard.
+	Stats(ctx context.Context) (AdminStats, error)
+}
+
+// AdminStats is the payload of the /admin/stats endpoint. Kept here
+// (not in models) because it's not a table row — it's a derived
+// aggregate that only the admin surface needs.
+type AdminStats struct {
+	ActiveSubscriptions int     `json:"active_subscriptions"`
+	TotalRevenue        float64 `json:"total_revenue"`
+	Created24h          int     `json:"created_24h"`
+	Cancelled24h        int     `json:"cancelled_24h"`
+	Expired24h          int     `json:"expired_24h"`
 }
 
 // postgresRepo is the concrete Postgres implementation.
@@ -201,8 +220,11 @@ func (r *postgresRepo) MarkPaymentSucceeded(ctx context.Context, paymentIntentID
 	// 3. Flip pending → active. Guarded by status='pending' so a
 	//    cancelled row isn't accidentally reactivated.
 	var newStatus string
+	// status_changed_at updated alongside status — Phase 11 admin
+	// /stats reads this column to answer "how many transitions
+	// happened in the last 24h."
 	err = tx.QueryRowContext(ctx, `
-		UPDATE subscriptions SET status = $1
+		UPDATE subscriptions SET status = $1, status_changed_at = NOW()
 		WHERE id = $2 AND status = $3
 		RETURNING status
 	`, models.StatusActive, s.ID, models.StatusPending).Scan(&newStatus)
@@ -235,7 +257,7 @@ func (r *postgresRepo) MarkPaymentSucceeded(ctx context.Context, paymentIntentID
 func (r *postgresRepo) MarkPaymentFailed(ctx context.Context, paymentIntentID string) (*models.Subscription, error) {
 	var s models.Subscription
 	err := r.db.QueryRowContext(ctx, `
-		UPDATE subscriptions SET status = $1
+		UPDATE subscriptions SET status = $1, status_changed_at = NOW()
 		WHERE payment_intent_id = $2 AND status = $3
 		RETURNING id, user_id, creator_id, plan, status, payment_intent_id,
 		          start_date, expires_at, auto_renew, created_at
@@ -303,7 +325,7 @@ func (r *postgresRepo) Cancel(ctx context.Context, id int) (int, error) {
 	// without a second round trip.
 	var userID int
 	err := r.db.QueryRowContext(ctx, `
-		UPDATE subscriptions SET status = $1
+		UPDATE subscriptions SET status = $1, status_changed_at = NOW()
 		WHERE id = $2 AND status = $3
 		RETURNING user_id
 	`, models.StatusCancelled, id, models.StatusActive).Scan(&userID)
@@ -346,7 +368,7 @@ func (r *postgresRepo) Cancel(ctx context.Context, id int) (int, error) {
 func (r *postgresRepo) ExpireOverdue(ctx context.Context) ([]ExpiredSub, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		UPDATE subscriptions
-		SET status = $1
+		SET status = $1, status_changed_at = NOW()
 		WHERE status = $2 AND expires_at < NOW()
 		RETURNING id, user_id, creator_id
 	`, models.StatusExpired, models.StatusActive)
@@ -387,4 +409,77 @@ func (r *postgresRepo) Renew(ctx context.Context, id int) (*models.Subscription,
 		return nil, err
 	}
 	return &s, nil
+}
+
+// ListAll returns a page of every subscription in the system.
+//
+// PAGINATION — LIMIT/OFFSET vs cursor:
+//
+//	LIMIT/OFFSET (what we do): trivial to implement, trivial for a
+//	client to request an arbitrary page (?limit=50&offset=200). The
+//	cost is that OFFSET N tells Postgres to READ and DISCARD the
+//	first N rows every time. At N=100k that's a lot of wasted I/O
+//	per request, and pages can shift under a client (a new row
+//	inserted between requests causes the same row to appear on two
+//	pages, or a row to be skipped entirely).
+//
+//	CURSOR-BASED (what we don't do): the client passes back the last
+//	row's created_at + id ("after=2026-08-17T10:23:45.123Z,42") and
+//	we WHERE (created_at, id) < (...) LIMIT N. No offset scan, no
+//	duplicate/skip under concurrent inserts. Cost: harder for a
+//	client to jump to page N without walking through 1..N-1.
+//
+// At Phase 11's expected scale (thousands to tens of thousands of
+// subscriptions total, admin usage low-QPS from a UI or CSV export)
+// OFFSET is fine. We rewrite if we ever have a real admin panel
+// paging through hundreds of thousands of rows or notice slow
+// queries in metrics.
+func (r *postgresRepo) ListAll(ctx context.Context, limit, offset int) ([]models.Subscription, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, user_id, creator_id, plan, status, payment_intent_id,
+		       start_date, expires_at, auto_renew, created_at
+		FROM subscriptions
+		ORDER BY created_at DESC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list all subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []models.Subscription
+	for rows.Next() {
+		var s models.Subscription
+		if err := rows.Scan(&s.ID, &s.UserID, &s.CreatorID, &s.Plan, &s.Status, &s.PaymentIntentID,
+			&s.StartDate, &s.ExpiresAt, &s.AutoRenew, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// Stats aggregates counts + revenue for the admin dashboard.
+//
+// One round trip, five subqueries. Alternative would be 5 separate
+// QueryRow calls — same query planner cost overall, but 5x the
+// network roundtrips. A single SELECT wrapping five subqueries is
+// what a DBA would write, and it's what we do.
+//
+// COALESCE(sum, 0) so SUM over an empty transactions table returns
+// 0 instead of NULL (which would fail to scan into float64).
+func (r *postgresRepo) Stats(ctx context.Context) (AdminStats, error) {
+	var s AdminStats
+	err := r.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM subscriptions WHERE status = 'active'),
+			COALESCE((SELECT SUM(amount) FROM transactions WHERE status = 'succeeded'), 0),
+			(SELECT COUNT(*) FROM subscriptions WHERE created_at        > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(*) FROM subscriptions WHERE status = 'cancelled' AND status_changed_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(*) FROM subscriptions WHERE status = 'expired'   AND status_changed_at > NOW() - INTERVAL '24 hours')
+	`).Scan(&s.ActiveSubscriptions, &s.TotalRevenue, &s.Created24h, &s.Cancelled24h, &s.Expired24h)
+	if err != nil {
+		return AdminStats{}, fmt.Errorf("admin stats: %w", err)
+	}
+	return s, nil
 }
