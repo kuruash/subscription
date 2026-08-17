@@ -9,7 +9,7 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 10 complete** — core CRUD API backed by Postgres, Redis
+**Status: Phase 11 complete** — core CRUD API backed by Postgres, Redis
 cache-aside on the list endpoint, a background worker that expires
 overdue subscriptions, an in-process notification queue, JWT auth on
 all subscription endpoints with per-user ownership checks, an automated
@@ -20,9 +20,13 @@ to `active` only when Stripe confirms), Redis-backed rate limiting on
 `/login` (per-IP) and the protected subscription routes
 (per-authenticated-user, correct across horizontally-scaled instances),
 Prometheus-compatible metrics exposed at `GET /metrics` (RED per route
-plus domain counters and an `active_subscriptions` gauge), and
-**GitHub Actions CI/CD** running build+vet+fmt+unit tests on every push
-and integration tests against ephemeral Postgres via testcontainers.
+plus domain counters and an `active_subscriptions` gauge), GitHub
+Actions CI/CD running build+vet+fmt+unit tests on every push and
+integration tests against ephemeral Postgres via testcontainers, and
+**a role-gated admin dashboard** — `GET /admin/subscriptions`
+(paginated list of every subscription) and `GET /admin/stats` (system-
+wide aggregates), gated by a `role` JWT claim and a `RequireAdmin`
+middleware.
 
 ---
 
@@ -175,6 +179,8 @@ All endpoints return JSON. Errors come back as `{"error": "..."}`.
 | GET    | `/users/:id/subscriptions`    | JWT  | 60/min/user | List a user's subscriptions (cached, self only) |
 | DELETE | `/subscriptions/:id`          | JWT  | 60/min/user | Cancel (soft delete, owner only)     |
 | POST   | `/subscriptions/:id/renew`    | JWT  | 60/min/user | Extend `expires_at` by 30 days (owner only) |
+| GET    | `/admin/subscriptions`        | JWT + admin role | 60/min/user | Paginated list of ALL subscriptions (see Phase 11) |
+| GET    | `/admin/stats`                | JWT + admin role | 60/min/user | System-wide aggregates (active count, revenue, 24h flow) |
 
 Rate limits are per-IP (login) or per-authenticated-user (subscriptions),
 shared across all API instances via Redis (see Phase 8 below).
@@ -1511,6 +1517,257 @@ git push
 
 ---
 
+## Phase 11: Admin dashboard (role-gated, read-only)
+
+Two new endpoints, both under `/admin/*`, both gated by a JWT `role`
+claim being `"admin"`. Read-only — no admin-cancel, no role-promote,
+no mutation of any kind this phase.
+
+### Endpoints
+
+- **`GET /admin/subscriptions?limit=50&offset=0`** — paginated list of
+  every subscription in the system, ordered newest-first.
+- **`GET /admin/stats`** — active-subscription count, total revenue
+  (sum of succeeded transactions), and subscriptions
+  created/cancelled/expired in the last 24h.
+
+### Schema change (migration 003)
+
+```sql
+ALTER TABLE users
+    ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE users
+    ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin'));
+
+ALTER TABLE subscriptions
+    ADD COLUMN status_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+```
+
+- `users.role` — default `'user'`, CHECK-constrained to bound the
+  value set. Every pre-Phase-11 row gets `'user'` automatically.
+- `subscriptions.status_changed_at` — updated by every status-mutating
+  UPDATE (Cancel, MarkPaymentSucceeded, MarkPaymentFailed,
+  ExpireOverdue). Enables the `stats` endpoint's "in last 24h"
+  queries without a separate audit table.
+
+### Why no self-service admin creation
+
+Admins are created **manually via SQL**:
+
+```bash
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "UPDATE users SET role='admin' WHERE id = <YOUR_USER_ID>;"
+```
+
+This is a deliberate gap, not an oversight. Bootstrapping admins via
+the API would need one of:
+
+- **First-login-is-admin** — a race between initial deploy and the
+  first attacker who guesses `/login {"user_id":1}`.
+- **Env-var auto-provision** — leaks the "who should be admin" list
+  into config, hard to rotate.
+- **Separate CLI or seed script** — has its own auth story to invent.
+
+All three are worse than "run one SQL update for the first admin,
+then admins can promote each other via an endpoint we haven't built
+yet." Fine for a single-team backend. Not fine for a multi-tenant
+SaaS, which we're not.
+
+### How seriously to take the admin gate right now — honest version
+
+`RequireAdmin` is **necessary but not sufficient** for real access
+control today. The middleware is correct: it reads the role claim
+from a signature-verified JWT and 403s anything that isn't
+`'admin'`.
+
+But the JWT is minted at `POST /login` — which **still has no
+password check** (see Phase 5 documented gaps). Right now the actual
+security posture is:
+
+> "Anyone who can hit `/login` and knows an admin's `user_id` can
+> mint an admin token."
+
+Not:
+
+> "Only authenticated admins can hit `/admin/*`."
+
+The gap is upstream in `/login`, not in `RequireAdmin`. The moment
+Phase 5's password check lands, `RequireAdmin` becomes a genuine
+authorization gate with no code changes needed. Until then:
+**do not deploy `/admin/*` to any network reachable by an
+untrusted party.**
+
+### Middleware chain for /admin/*
+
+`RequireAuth → RequireAdmin → subLimiter`, in that order:
+
+```go
+admin := r.Group("",
+    middleware.RequireAuth(jwtSecret),     // parse JWT, stash uid + role
+    middleware.RequireAdmin(),             // 403 if role != "admin"
+    subLimiter.Handler(),                  // 60/min per user
+)
+adminH.Register(admin)
+```
+
+`RequireAdmin` reads the role that `RequireAuth` stashed — reversing
+the order silently makes it a no-op (RoleFrom returns `ok=false` on
+a request that hasn't gone through auth, and `RequireAdmin` treats
+that as "not admin," so paradoxically the wrong order fails closed
+rather than open — but "correct order or every request 403s" is
+still a misconfiguration).
+
+### Pagination: LIMIT/OFFSET (not cursor)
+
+`/admin/subscriptions` uses `LIMIT/OFFSET`. Trade:
+
+- **LIMIT/OFFSET (what we do)**: trivial for clients (`?limit=50
+  &offset=200`), trivial to implement. Cost: `OFFSET N` scans and
+  discards N rows; also has stale-view issues where an insert
+  between page requests can cause the same row to appear on two
+  pages or a row to be skipped entirely.
+- **Cursor-based** (`?after=<created_at>,<id>`): no offset scan, no
+  duplicate/skip under concurrent writes. Cost: harder for a client
+  to jump to page N without walking 1..N-1.
+
+At Phase 11's expected scale (tens of thousands of subscriptions
+total, low-QPS admin usage from a UI or CSV export) OFFSET is fine.
+Rewrite as cursor if we ever hit hundreds of thousands or start
+seeing slow queries in the histogram from Phase 9.
+
+### End-to-end test recipe
+
+**1. Fresh clean baseline:** the test user (`user_id=1`) starts as
+`role='user'` (default from migration 003).
+
+```bash
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "SELECT id, username, role FROM users;"
+# → alice, role='user'
+```
+
+**2. Mint a NON-admin token and confirm /admin/* returns 403:**
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq -r .token)
+
+curl -s -i -H "Authorization: Bearer $TOKEN" localhost:8080/admin/stats | head -3
+# → HTTP/1.1 403 Forbidden
+# → {"error":"admin access required"}
+
+curl -s -i -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/admin/subscriptions?limit=10' | head -3
+# → HTTP/1.1 403 Forbidden
+```
+
+Also verify the login response echoes the role for UI use:
+```bash
+curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq
+# → {"token":"...", "expires_at":"...", "role":"user"}
+```
+
+**3. Promote to admin in Postgres:**
+
+```bash
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "UPDATE users SET role='admin' WHERE id=1;"
+# → UPDATE 1
+
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "SELECT id, username, role FROM users WHERE id=1;"
+# → alice, role='admin'
+```
+
+**4. Mint a FRESH token — the promotion is picked up at login time,
+not on the existing token** (see the Phase 11 docs on JWT-vs-DB role
+lookup):
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq -r .token)
+# The response's "role":"admin" now confirms the DB was queried.
+```
+
+**5. Hit the admin endpoints — 200 with real data:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  localhost:8080/admin/stats | jq
+```
+
+Expected shape (values reflect whatever data you've built up
+across previous phases):
+
+```json
+{
+  "active_subscriptions": 3,
+  "total_revenue": 14.97,
+  "created_24h": 5,
+  "cancelled_24h": 2,
+  "expired_24h": 0
+}
+```
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/admin/subscriptions?limit=5' | jq
+```
+
+Expected shape:
+
+```json
+{
+  "subscriptions": [
+    {"id": 12, "user_id": 1, "creator_id": 1, "status": "active", ...},
+    {"id": 11, "user_id": 1, "creator_id": 1, "status": "cancelled", ...},
+    ...
+  ],
+  "limit": 5,
+  "offset": 0,
+  "count": 5
+}
+```
+
+**6. Verify pagination:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/admin/subscriptions?limit=2&offset=0' | jq '.subscriptions | length'
+# → 2
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/admin/subscriptions?limit=2&offset=2' | jq '.subscriptions | length'
+# → 2 (a different page)
+```
+
+**7. Verify the demote path** (optional — proves role changes need
+a fresh token):
+
+```bash
+docker exec subs_postgres psql -U subs -d subscriptions -c \
+  "UPDATE users SET role='user' WHERE id=1;"
+
+# The EXISTING token from step 4 is still an admin JWT — it works
+# for up to 15 minutes:
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" localhost:8080/admin/stats
+# → 200   (existing token unaffected — this is the documented gap)
+
+# A NEW token reflects the demotion immediately:
+TOKEN2=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1}' | jq -r .token)
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN2" localhost:8080/admin/stats
+# → 403
+```
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
@@ -1524,4 +1781,18 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 8 — Rate limiting (Redis-backed fixed-window, per-IP on /login, per-user on protected routes)~~ ✅
 - ~~Phase 9 — Prometheus-compatible metrics endpoint (RED + domain counters + active-subs gauge)~~ ✅
 - ~~Phase 10 — GitHub Actions CI/CD (fast job on every push, integration job via testcontainers)~~ ✅
-- Phase 11 — Admin dashboard
+- ~~Phase 11 — Admin dashboard (role-gated, read-only aggregates + paginated list)~~ ✅
+
+**All planned phases complete.** Follow-ups worth doing next
+(unordered):
+
+- Password check on `/login` (closes the Phase 5 gap that makes
+  the RBAC gate real).
+- Refresh tokens + revocation list.
+- Deploy pipeline (Docker image build, registry push, target env).
+- Admin mutation endpoints (admin-cancel, role-promote, refund) once
+  we have an audit/approval story.
+- Cursor-based pagination on `/admin/subscriptions` when scale
+  demands it.
+- Frontend to let redirect-based Stripe payment methods work (lifts
+  the Phase 7 `AllowRedirects="never"` restriction).
