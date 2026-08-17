@@ -18,7 +18,10 @@ import (
 // using an unexported type makes collisions impossible.
 type ctxKey int
 
-const userIDKey ctxKey = iota
+const (
+	userIDKey ctxKey = iota
+	roleKey
+)
 
 // UserIDFrom returns the authenticated user's ID that RequireAuth stashed
 // on the context. Second return is false if the request wasn't
@@ -37,6 +40,22 @@ func UserIDFrom(ctx context.Context) (int, bool) {
 // via UserIDFrom.
 func WithUserID(ctx context.Context, userID int) context.Context {
 	return context.WithValue(ctx, userIDKey, userID)
+}
+
+// RoleFrom returns the role claim RequireAuth stashed on the context.
+// Second return is false if there's no role at all — treat as "not
+// admin" at the call site (that's what RequireAdmin does).
+func RoleFrom(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(roleKey).(string)
+	return v, ok
+}
+
+// WithRole stashes a role on the context under the same key
+// RequireAuth uses. Same purpose as WithUserID: tests and future
+// alternative auth paths can populate it without going through the
+// full JWT parse.
+func WithRole(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, roleKey, role)
 }
 
 // RequireAuth verifies a Bearer JWT and stashes the user ID on the
@@ -66,17 +85,18 @@ func RequireAuth(secret []byte) gin.HandlerFunc {
 			return
 		}
 
-		userID, err := auth.Parse(token, secret)
+		userID, role, err := auth.Parse(token, secret)
 		if err != nil {
 			// Deliberately not surfacing which check failed — see auth.Parse.
 			unauthorized(c, "invalid or expired token")
 			return
 		}
 
-		// Stash on the request's context.Context (not just gin.Context)
-		// so services/repositories that only accept a plain ctx can read
-		// it if they ever need to.
+		// Stash both on the request's context.Context (not just
+		// gin.Context) so services/repositories that only accept a
+		// plain ctx can read it if they ever need to.
 		ctx := context.WithValue(c.Request.Context(), userIDKey, userID)
+		ctx = context.WithValue(ctx, roleKey, role)
 		c.Request = c.Request.WithContext(ctx)
 
 		c.Next()

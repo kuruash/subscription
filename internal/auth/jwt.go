@@ -37,22 +37,39 @@ const TokenTTL = 15 * time.Minute
 
 // Claims is what we put inside the JWT payload.
 // jwt.RegisteredClaims embedding adds the standard fields (`exp`, `iat`,
-// `iss`, etc.) as JSON keys. Our custom field is `uid`.
+// `iss`, etc.) as JSON keys. Our custom fields are `uid` and (Phase 11)
+// `role`.
+//
+// PHASE 11 NOTE — role in the token:
+// The role is baked in at LOGIN time. That means a promotion or
+// demotion doesn't take effect until the user's next login (or their
+// current token expires — see TokenTTL). Trade for instant revocation
+// would be a Redis-backed token denylist or per-request DB lookup;
+// both are Phase 5 documented gaps (see README). At 15-min TTL and a
+// stub /login endpoint, this is fine for now.
 type Claims struct {
-	UserID int `json:"uid"`
+	UserID int    `json:"uid"`
+	Role   string `json:"role"`
 	jwt.RegisteredClaims
 }
 
-// Sign creates a signed JWT for the given user.
+// Sign creates a signed JWT for the given user + role.
 // Signing method HS256 = HMAC + SHA256 with a shared secret. Fine for a
 // single-service backend; asymmetric signing (RS256) is only needed when
 // you have multiple services verifying tokens issued elsewhere and don't
 // want to distribute the signing secret.
-func Sign(userID int, secret []byte) (string, time.Time, error) {
+//
+// The role parameter is passed through to the JWT claim as-is. The
+// caller (auth_handler.login) is responsible for reading it from the
+// DB so a mint request can't just claim any role — passing a
+// user-supplied role directly here would let anyone with /login access
+// mint an admin token.
+func Sign(userID int, role string, secret []byte) (string, time.Time, error) {
 	now := time.Now()
 	expires := now.Add(TokenTTL)
 	claims := Claims{
 		UserID: userID,
+		Role:   role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expires),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -68,15 +85,16 @@ func Sign(userID int, secret []byte) (string, time.Time, error) {
 	return s, expires, nil
 }
 
-// Parse verifies the signature + expiration and returns the user ID.
-// A single error is returned for any failure mode (bad signature, expired,
-// malformed, wrong algorithm) — callers translate this to a 401 without
-// leaking which specific check failed, so an attacker can't tell "this
-// token is expired" apart from "this token was never valid."
+// Parse verifies the signature + expiration and returns the user ID
+// and role. A single error is returned for any failure mode (bad
+// signature, expired, malformed, wrong algorithm) — callers translate
+// this to a 401 without leaking which specific check failed, so an
+// attacker can't tell "this token is expired" apart from "this token
+// was never valid."
 var ErrInvalidToken = errors.New("invalid token")
 
-func Parse(tokenString string, secret []byte) (int, error) {
-	parsed, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(t *jwt.Token) (interface{}, error) {
+func Parse(tokenString string, secret []byte) (userID int, role string, err error) {
+	parsed, perr := jwt.ParseWithClaims(tokenString, &Claims{}, func(t *jwt.Token) (interface{}, error) {
 		// Defense in depth: reject tokens whose header claims a different
 		// algorithm than what we sign with. Prevents the classic "alg=none"
 		// and algorithm-confusion attacks.
@@ -85,12 +103,15 @@ func Parse(tokenString string, secret []byte) (int, error) {
 		}
 		return secret, nil
 	})
-	if err != nil || !parsed.Valid {
-		return 0, ErrInvalidToken
+	if perr != nil || !parsed.Valid {
+		return 0, "", ErrInvalidToken
 	}
 	claims, ok := parsed.Claims.(*Claims)
 	if !ok || claims.UserID <= 0 {
-		return 0, ErrInvalidToken
+		return 0, "", ErrInvalidToken
 	}
-	return claims.UserID, nil
+	// Role can legitimately be empty on tokens minted before Phase 11
+	// (pre-role tokens are still valid until TTL). RequireAdmin treats
+	// empty role as non-admin, which is the right default.
+	return claims.UserID, claims.Role, nil
 }

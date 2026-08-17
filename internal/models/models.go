@@ -25,11 +25,23 @@ import "time"
 // the package). Lowercase = package-private. This is enforced by the
 // compiler, not convention — no `public`/`private` keywords exist.
 type User struct {
-	ID        int       `json:"id"`
-	Username  string    `json:"username"`
-	Email     string    `json:"email"`
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	// Role — added Phase 11. "user" or "admin"; see
+	// migrations/003_add_role_and_status_changed_at.sql for the CHECK
+	// constraint that keeps the value set bounded.
+	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// Role constants — Go's typed-const stand-in for an enum. Reference
+// these from middleware / handler code instead of raw "admin"
+// strings so a typo is a compile error rather than a silent 403.
+const (
+	RoleUser  = "user"
+	RoleAdmin = "admin"
+)
 
 type Creator struct {
 	ID        int       `json:"id"`
