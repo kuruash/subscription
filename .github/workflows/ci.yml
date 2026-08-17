@@ -1,0 +1,141 @@
+# .github/workflows/ci.yml — Phase 10
+#
+# Runs on every push and every pull_request targeting main. Two jobs:
+#
+#   1. `fast` — pure-Go checks that don't need Docker or a database.
+#      Runs on every push, gives feedback in <1 min.
+#
+#   2. `integration` — the //go:build integration tests, which spin up
+#      their own Postgres container via testcontainers-go. Runs in the
+#      same trigger set; slower (~1-2 min for the container boot alone)
+#      but still deterministic and self-contained.
+#
+# WHY NO `services:` BLOCK EVEN THOUGH WE RUN INTEGRATION TESTS:
+# GitHub Actions has a `services:` primitive that runs sidecar
+# containers (e.g. a postgres:16-alpine you'd connect to at
+# localhost:5432). Our repository integration tests DON'T use it —
+# they use testcontainers-go to boot their own Postgres inside the
+# test binary. That predates this workflow (established in Phase 6)
+# and is deliberate: the same `go test -tags integration ./...`
+# command works locally (with just Docker) without needing a
+# separate compose stack. Adding a `services:` Postgres here would
+# be dead weight — the testcontainers-managed container would ignore
+# it entirely.
+#
+# The GitHub Actions ubuntu-latest runner ships with Docker installed
+# and running, which is all testcontainers needs.
+#
+# WHAT DIFFERS FROM LOCAL docker-compose.yml:
+#   - docker-compose.yml is for INTERACTIVE dev (long-lived Postgres +
+#     Redis you `docker compose up -d` once and reuse for hours).
+#   - CI provisions everything ephemeral per run: testcontainers spins
+#     a fresh Postgres for the test binary and tears it down at the
+#     end. No shared state between runs, no leftover data.
+#   - CI has no Redis at all — nothing in the currently-run jobs
+#     needs it (service unit tests use miniredis; integration tests
+#     touch only Postgres).
+#
+# WHY NO STRIPE-WEBHOOK E2E JOB:
+# The Phase 7 webhook flow requires real (test-mode) Stripe API
+# credentials AND a `stripe listen` process to forward events. That
+# means:
+#   - Real secrets checked into GitHub Actions (leak risk).
+#   - Non-deterministic network calls against api.stripe.com (a
+#     Stripe outage would red-star our CI).
+#   - Async webhook delivery with retry backoff — hard to assert on
+#     a fixed timeline.
+# The behavior we care about (idempotency, signature verification,
+# state transitions) is already covered by:
+#   - Unit tests: TestMarkPaymentSucceeded_DuplicateEventDoesNotDoublePublish
+#   - Integration tests: TestMarkPaymentSucceeded_IdempotentOnDuplicateEvent
+# The full end-to-end recipe stays in README as a manual test to run
+# before releasing changes to the webhook path.
+#
+# SECRETS THIS WORKFLOW ACTUALLY NEEDS: none.
+#   - JWT_SECRET: neither job hits any code path that reads it.
+#   - STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET: not needed — Stripe
+#     E2E is out-of-scope per above.
+# Don't add secrets speculatively. When a future job actually needs
+# one (e.g. deploy step reading DOCKERHUB_TOKEN, or an E2E job
+# reading a Stripe key), add it then, scoped to that job.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fast:
+    name: Build, vet, fmt, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # setup-go with cache=true (default in v5) restores $GOPATH/pkg/mod
+      # and $GOCACHE keyed on go.sum. First run on a branch downloads and
+      # compiles every dep from scratch (~40-60s for this project).
+      # Every subsequent run on the same go.sum reuses the cache and
+      # setup completes in ~5-10s — the meaningful win when a PR gets
+      # 20+ commits over its life.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # gofmt -l prints a list of files that would be reformatted.
+      # If the list is non-empty, fail loudly with the file names so
+      # the dev can `gofmt -w` locally without hunting.
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-clean:"
+            echo "$unformatted"
+            echo ""
+            echo "Run: gofmt -w ."
+            exit 1
+          fi
+
+      # Unit tests only — no `-tags integration`, so testcontainers
+      # tests are excluded and this job runs entirely in-process.
+      # miniredis stands in for Redis; hand-written fakes stand in
+      # for the repo and Stripe client.
+      - name: unit tests
+        run: go test ./...
+
+  integration:
+    name: Integration tests (Postgres via testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # No manual docker steps needed — the ubuntu-latest runner
+      # ships with Docker installed and running, and testcontainers-go
+      # discovers it automatically via /var/run/docker.sock.
+      #
+      # The `-tags integration` flag flips on the //go:build integration
+      # files in internal/repository. TestMain there boots a
+      # postgres:16-alpine container, applies migrations/001 and 002
+      # via WithInitScripts, runs the tests, and tears the container
+      # down when the process exits. Nothing to configure in this
+      # workflow beyond the tag.
+      - name: integration tests
+        run: go test -tags integration ./...

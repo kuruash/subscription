@@ -40,7 +40,7 @@ import (
 // (for state changes) — the SDK stays behind those interfaces, so this
 // handler doesn't import stripe-go directly.
 type StripeWebhookHandler struct {
-	svc     *services.SubscriptionService
+	svc       *services.SubscriptionService
 	payClient payments.Client
 }
 

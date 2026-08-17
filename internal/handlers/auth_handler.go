@@ -17,10 +17,10 @@ import (
 // without also building a full user/password/hashing system.
 //
 // A real login endpoint would:
-//   1. Take email + password.
-//   2. Look up the user, compare the password against a bcrypt/argon2
-//      hash stored in the users table.
-//   3. Only then issue a token, using the DB row's id as the subject.
+//  1. Take email + password.
+//  2. Look up the user, compare the password against a bcrypt/argon2
+//     hash stored in the users table.
+//  3. Only then issue a token, using the DB row's id as the subject.
 type AuthHandler struct {
 	secret []byte
 }

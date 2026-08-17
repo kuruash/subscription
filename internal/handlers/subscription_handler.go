@@ -1,7 +1,7 @@
 // Package handlers is the HTTP layer. Each handler does exactly three things:
-//   1. Parse the request (URL params, JSON body)
-//   2. Call the service
-//   3. Translate the result (or error) into an HTTP status + JSON
+//  1. Parse the request (URL params, JSON body)
+//  2. Call the service
+//  3. Translate the result (or error) into an HTTP status + JSON
 //
 // No business logic, no SQL. If a handler is getting long, the logic
 // probably belongs in services/.

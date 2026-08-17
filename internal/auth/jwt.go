@@ -2,7 +2,9 @@
 //
 // A JWT ("JSON Web Token") is three base64-url-encoded parts separated
 // by dots:
-//   header.payload.signature
+//
+//	header.payload.signature
+//
 // Only the signature is secret-derived; the header and payload are just
 // base64-encoded JSON — trivially decodable by anyone who has the token.
 //
@@ -26,6 +28,7 @@ import (
 //   - Short enough that a stolen token can't be used indefinitely.
 //   - Long enough that a normal user session doesn't need to re-login
 //     every few requests.
+//
 // Real systems pair this with a longer-lived refresh token so that the
 // user's actual login session lasts hours/days without the API needing
 // to trust a long-lived JWT. Refresh tokens are a Phase 5 GAP — see

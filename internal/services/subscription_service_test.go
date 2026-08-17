@@ -109,8 +109,8 @@ func (f *fakeRepo) ExpireOverdue(ctx context.Context) ([]repository.ExpiredSub, 
 // so a misconfigured test fails immediately with a clear signal instead
 // of returning a plausible-looking zero value.
 type fakePayments struct {
-	CreatePaymentIntentFn     func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error)
-	VerifyWebhookSignatureFn  func(payload []byte, sigHeader string) (*payments.Event, error)
+	CreatePaymentIntentFn    func(ctx context.Context, amountCents int64, currency string, metadata map[string]string) (*payments.PaymentIntent, error)
+	VerifyWebhookSignatureFn func(payload []byte, sigHeader string) (*payments.Event, error)
 	// CreatePaymentIntentCalls counts invocations — needed to prove
 	// negative-space claims (e.g. "CreatePending was NOT called" is
 	// asserted via the *repo* fake's call log, but "CreatePaymentIntent
@@ -161,7 +161,7 @@ type delSpy struct {
 	counts map[string]int
 }
 
-func newDelSpy() *delSpy { return &delSpy{counts: map[string]int{}} }
+func newDelSpy() *delSpy                                      { return &delSpy{counts: map[string]int{}} }
 func (s *delSpy) DialHook(next redis.DialHook) redis.DialHook { return next }
 func (s *delSpy) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
@@ -424,10 +424,10 @@ func TestMarkPaymentFailed_InvalidatesButDoesNotPublish(t *testing.T) {
 // ownershipCase covers the three cases each *ForUser method must handle
 // identically: owner (ok), not-found (404), forbidden (403).
 type ownershipCase struct {
-	name       string
-	getResult  *models.Subscription
-	getErr     error
-	wantErrIs  error // nil means expect no error
+	name      string
+	getResult *models.Subscription
+	getErr    error
+	wantErrIs error // nil means expect no error
 }
 
 var authUser = 5

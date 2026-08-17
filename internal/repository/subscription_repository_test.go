@@ -4,7 +4,8 @@
 //
 // Gated by the `integration` build tag so `go test ./...` stays fast and
 // doesn't need Docker running. To execute this file:
-//   go test -tags integration ./internal/repository/...
+//
+//	go test -tags integration ./internal/repository/...
 //
 // APPROACH: testcontainers-go/modules/postgres.
 // Each `go test` run spins up a fresh Postgres 16 container, applies our
@@ -230,8 +231,8 @@ func TestExpireOverdue_OnlyTouchesActiveOverdueRows(t *testing.T) {
 		return id
 	}
 
-	overdueActive := insertSub(1, 1, models.StatusActive, now.Add(-time.Hour))     // should flip
-	freshActive := insertSub(1, 2, models.StatusActive, now.Add(24*time.Hour))     // must NOT flip
+	overdueActive := insertSub(1, 1, models.StatusActive, now.Add(-time.Hour))       // should flip
+	freshActive := insertSub(1, 2, models.StatusActive, now.Add(24*time.Hour))       // must NOT flip
 	alreadyCancelled := insertSub(2, 1, models.StatusCancelled, now.Add(-time.Hour)) // overdue but not active — must NOT flip
 
 	repo := repository.NewPostgresRepo(testDB)

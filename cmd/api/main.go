@@ -2,7 +2,9 @@
 //
 // Go convention: anything under cmd/<name>/main.go compiles to a binary
 // named <name>. Building this from the repo root:
-//     go run ./cmd/api
+//
+//	go run ./cmd/api
+//
 // The `package main` + `func main()` combo is what makes it an executable
 // rather than a library.
 package main
@@ -19,8 +21,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq" // blank import: registers the "postgres" driver
-	                     // with database/sql. We never call pq directly here,
-	                     // but without this line sql.Open("postgres", ...) fails.
+	// with database/sql. We never call pq directly here,
+	// but without this line sql.Open("postgres", ...) fails.
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 

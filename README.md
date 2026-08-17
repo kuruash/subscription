@@ -1,5 +1,7 @@
 # Subscription Service
 
+[![CI](https://github.com/kuruash/subscription/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kuruash/subscription/actions/workflows/ci.yml)
+
 A production-style subscription backend in Go, built as a learning project.
 Think Twitch/Patreon-style creator subscriptions: users subscribe to creators
 on a monthly plan, subscriptions expire, get cancelled, or renew.
@@ -7,7 +9,7 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 9 complete** — core CRUD API backed by Postgres, Redis
+**Status: Phase 10 complete** — core CRUD API backed by Postgres, Redis
 cache-aside on the list endpoint, a background worker that expires
 overdue subscriptions, an in-process notification queue, JWT auth on
 all subscription endpoints with per-user ownership checks, an automated
@@ -17,10 +19,10 @@ idempotent webhook processing (subscriptions start `pending` and flip
 to `active` only when Stripe confirms), Redis-backed rate limiting on
 `/login` (per-IP) and the protected subscription routes
 (per-authenticated-user, correct across horizontally-scaled instances),
-and **Prometheus-compatible metrics** exposed at `GET /metrics` — RED
-(rate/errors/duration) on every route via middleware, plus domain
-counters for subscriptions created/cancelled/expired, cache hit/miss,
-rate-limit rejections, and an `active_subscriptions` gauge.
+Prometheus-compatible metrics exposed at `GET /metrics` (RED per route
+plus domain counters and an `active_subscriptions` gauge), and
+**GitHub Actions CI/CD** running build+vet+fmt+unit tests on every push
+and integration tests against ephemeral Postgres via testcontainers.
 
 ---
 
@@ -1349,6 +1351,166 @@ IP allowlisting is a ~10-line middleware if/when we deploy.
 
 ---
 
+## Phase 10: GitHub Actions CI/CD
+
+`.github/workflows/ci.yml` runs on every push and every PR targeting
+`main`. The badge at the top of this README shows pass/fail for the
+latest run on main.
+
+### Two jobs
+
+**`fast`** — pure-Go checks, ~30-60s on cached runs:
+
+- `actions/checkout@v4`
+- `actions/setup-go@v5` with `cache: true` (default)
+- `go build ./...`
+- `go vet ./...`
+- `gofmt -l .` — fails loudly with the file list if anything's
+  unformatted
+- `go test ./...` (unit only, no integration tag)
+
+**`integration`** — the `//go:build integration` tests, ~1-2 min:
+
+- Same checkout + setup-go
+- `go test -tags integration ./...`
+
+### Why no `services:` block for Postgres
+
+GitHub Actions has a `services:` primitive that runs sidecar
+containers on `localhost:5432` for the job. Our integration tests
+**don't use it** — they use `testcontainers-go` (established in
+Phase 6) to spin up their own Postgres inside the test binary,
+apply migrations 001 + 002 via `WithInitScripts`, and tear down
+when `TestMain` exits.
+
+Adding a `services:` Postgres to this workflow would be dead
+weight — testcontainers would ignore it and spin up its own
+container anyway. The runner has Docker installed and running by
+default, which is all testcontainers needs.
+
+### How this differs from local `docker-compose.yml`
+
+- `docker-compose.yml` is for **interactive dev**: a long-lived
+  Postgres + Redis you `docker compose up -d` once and reuse for
+  hours across many `go run` cycles.
+- CI is **fully ephemeral per run**: testcontainers boots a fresh
+  Postgres for the test binary, runs the tests, kills it. Nothing
+  persists between runs. No "did you remember to reset the DB"
+  step, no shared state.
+- CI has **no Redis at all** — nothing in the currently-run jobs
+  needs one. Unit tests use miniredis in-process; integration tests
+  only touch Postgres.
+
+### Why `actions/setup-go` with caching
+
+`cache: true` (the default in v5 when `go-version-file` is set)
+restores `$GOPATH/pkg/mod` and `$GOCACHE` keyed on `go.sum`.
+
+- **First run on a branch:** downloads and compiles every
+  dependency from scratch. For this project that's ~40-60s (mostly
+  testcontainers + all its Docker plumbing deps + the Prometheus
+  client library).
+- **Cached run** (go.sum unchanged): dependency cost drops to
+  ~5-10s of restore + hash verification. Compile itself is fast
+  because `$GOCACHE` also gets restored.
+
+The saving matters more than "per push" would suggest — a PR
+that lives for 20 commits and 20 CI runs saves ~15 minutes total,
+and cache-warm runs are the difference between "CI feels snappy"
+and "I'll go grab a coffee and come back."
+
+### Why the Stripe webhook flow is deliberately NOT in CI
+
+The Phase 7 end-to-end flow needs:
+1. Real (test-mode) Stripe API credentials in the runner.
+2. A `stripe listen` sidecar to forward webhook events.
+3. Network calls against api.stripe.com, whose availability isn't
+   ours to SLA against.
+4. Async webhook delivery with retry backoff — hard to assert on
+   a fixed CI timeline.
+
+The behaviors we care about are covered without any of that:
+
+- **Idempotency guarantee** — unit test
+  `TestMarkPaymentSucceeded_DuplicateEventDoesNotDoublePublish`
+  (fake repo + fake payments client).
+- **Repository-level idempotency** — integration test
+  `TestMarkPaymentSucceeded_IdempotentOnDuplicateEvent` (real
+  Postgres via testcontainers).
+- **Signature verification** — proven manually + covered indirectly
+  by the payments package unit test surface.
+
+The full stripe-listen recipe stays in Phase 7 above as a **manual
+release-time smoke test**. Run it before releasing changes to the
+webhook path; skip it for pure-refactor PRs.
+
+### Secrets required by this workflow: **none**
+
+Neither job reads:
+
+- `JWT_SECRET` — no code path in fast/integration touches token
+  minting (unit tests fake it; integration tests are repository-only)
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` — Stripe E2E is
+  intentionally out-of-scope per above
+
+Don't add secrets to the repo speculatively. The moment a future
+job actually needs one (a deploy step reading `DOCKERHUB_TOKEN`,
+an E2E job reading a Stripe key), add it then, scoped to that job
+via the `env:` block.
+
+### How to verify this yourself
+
+**See the workflow run on GitHub after pushing:**
+
+1. `git push origin main` (or open a PR).
+2. Open the repo on github.com → **Actions** tab.
+3. Click the "CI" workflow in the left sidebar.
+4. Click the run for your commit — you'll see both `fast` and
+   `integration` jobs. Green check = pass, red X = failure.
+5. Click any job to see step-by-step logs. Click a step to expand
+   its output — Go compiler errors, `go vet` warnings, `gofmt`
+   listings, and test failures all appear inline.
+
+**Break something on purpose to confirm CI catches it:**
+
+```bash
+# 1. Break formatting
+echo '// bad'  >> internal/services/subscription_service.go
+git commit -am "break: unformatted comment"
+git push
+# → CI 'fast' job fails at "gofmt check" step with a file list.
+
+# Fix and re-push:
+gofmt -w .
+git commit -am "fix: gofmt"
+git push
+# → next run passes.
+
+# 2. Break a test
+sed -i '' 's/StatusPending/StatusActive/' internal/services/subscription_service.go
+git commit -am "break: wrong status"
+git push
+# → CI 'fast' job fails at "unit tests" step with the failing
+#   TestSubscribe_* case; 'integration' also fails downstream.
+# Revert:
+git revert --no-edit HEAD
+git push
+```
+
+**Find the logs of a failing run:**
+
+- Actions tab → the failed run → click the failing job → click
+  the failed step (has a red X next to it). Full output is
+  copy-pasteable. Common failure signatures:
+  - `The following files are not gofmt-clean:` → run `gofmt -w .`
+  - `--- FAIL: TestFoo` → the actual test assertion is in the
+    output above the FAIL marker.
+  - `pq: connection refused` in the integration job → testcontainers
+    couldn't get Docker; usually a runner infrastructure blip,
+    re-run the job.
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
@@ -1361,5 +1523,5 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 7 — Stripe sandbox payments + webhooks (pending-until-paid, idempotent)~~ ✅
 - ~~Phase 8 — Rate limiting (Redis-backed fixed-window, per-IP on /login, per-user on protected routes)~~ ✅
 - ~~Phase 9 — Prometheus-compatible metrics endpoint (RED + domain counters + active-subs gauge)~~ ✅
-- Phase 10 — GitHub Actions CI/CD
+- ~~Phase 10 — GitHub Actions CI/CD (fast job on every push, integration job via testcontainers)~~ ✅
 - Phase 11 — Admin dashboard

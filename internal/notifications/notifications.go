@@ -53,6 +53,7 @@ type Queue struct {
 // NewQueue returns a Queue with a buffered channel. Buffer size matters:
 //   - too small → a burst of subscribes will drop events under load
 //   - too large → memory grows unbounded if the consumer stalls
+//
 // 128 is a comfortable local-dev / low-scale default; production would
 // tune this based on measured throughput and switch to SQS anyway.
 func NewQueue(buffer int) *Queue {
@@ -80,12 +81,12 @@ func NewQueue(buffer int) *Queue {
 // Documented gap (same category as Phase 2's Redis DEL failure and Phase
 // 3's worker-restart timing): no retry, no dead-letter queue. Acceptable
 // at this stage because:
-//   1. The primary system-of-record state (Postgres) is unaffected.
-//   2. Under normal load the buffer is never full — dropped events would
-//      show up as WARN logs, giving us signal before it becomes a real
-//      problem.
-//   3. The fix (durable queue, ack/retry semantics) is exactly what SQS
-//      gives us for free once we swap the implementation.
+//  1. The primary system-of-record state (Postgres) is unaffected.
+//  2. Under normal load the buffer is never full — dropped events would
+//     show up as WARN logs, giving us signal before it becomes a real
+//     problem.
+//  3. The fix (durable queue, ack/retry semantics) is exactly what SQS
+//     gives us for free once we swap the implementation.
 func (q *Queue) Publish(ev Event) {
 	select {
 	case q.ch <- ev:
