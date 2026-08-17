@@ -21,9 +21,11 @@ import (
 	_ "github.com/lib/pq" // blank import: registers the "postgres" driver
 	                     // with database/sql. We never call pq directly here,
 	                     // but without this line sql.Open("postgres", ...) fails.
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"subscription-service/internal/handlers"
+	"subscription-service/internal/metrics"
 	"subscription-service/internal/middleware"
 	"subscription-service/internal/notifications"
 	"subscription-service/internal/payments"
@@ -133,8 +135,40 @@ func main() {
 	authH := handlers.NewAuthHandler(jwtSecret)
 
 	r := gin.Default()
+
+	// --- Metrics middleware (Phase 9) ---
+	//
+	// Attached BEFORE any other middleware so the duration it records
+	// covers the full handler chain (auth parse, rate-limit lookup,
+	// DB calls, JSON marshal). If we put it after RequireAuth we'd
+	// under-count latency by the auth cost — a bad trade because auth
+	// cost is one of the things we want to see if it ever spikes.
+	//
+	// The middleware itself is <300 ns/request steady state — well
+	// below the noise floor of any real handler work. See the
+	// PERFORMANCE note at the top of internal/middleware/metrics.go
+	// for the actual numbers.
+	r.Use(middleware.Metrics())
+
 	// Public routes — no auth required.
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+
+	// GET /metrics — Prometheus scrape endpoint.
+	//
+	// PUBLIC (no JWT). Same reasoning as POST /webhooks/stripe: the
+	// caller is a metrics scraper (Prometheus, a sidecar, a Grafana
+	// Agent), not a logged-in user. It doesn't have — and shouldn't
+	// need — one of our tokens; requiring one would mean sharing a
+	// JWT secret with the scraping infrastructure, which is a much
+	// worse security posture than leaving /metrics readable.
+	//
+	// In production the /metrics endpoint is typically network-
+	// isolated (a private port, a mesh-only path, or an IP allowlist
+	// at the LB) so exposure is limited to the scraper. We don't
+	// implement that here — trivial to add later with a middleware
+	// that checks c.ClientIP() against an allowlist, or by binding
+	// /metrics to a second http.Server on a different port.
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// --- Rate limiters (Phase 8) ---
 	//
@@ -211,6 +245,45 @@ func main() {
 	// (RequireAuth, subLimiter) is the correct order.
 	protected := r.Group("", middleware.RequireAuth(jwtSecret), subLimiter.Handler())
 	subH.Register(protected)
+
+	// --- Active-subscriptions gauge updater (Phase 9) ---
+	//
+	// A goroutine that runs a `SELECT COUNT(*) WHERE status='active'`
+	// every 15s and sets the gauge. Design tradeoff (periodic query
+	// vs increment/decrement on state transitions) is documented in
+	// full at internal/metrics/metrics.go — TL;DR: periodic query
+	// cannot drift, works trivially across horizontally-scaled
+	// instances (they all query the same DB), and 4 indexed COUNTs
+	// per minute is cost noise.
+	//
+	// Runs in the API process only, not the worker, because the API
+	// serves /metrics — worker doesn't need to update this gauge
+	// (they'd both write and either read the same value).
+	gaugeCtx, gaugeCancel := context.WithCancel(context.Background())
+	defer gaugeCancel()
+	go func() {
+		tick := time.NewTicker(15 * time.Second)
+		defer tick.Stop()
+		refresh := func() {
+			var n int
+			qctx, qcancel := context.WithTimeout(gaugeCtx, 2*time.Second)
+			defer qcancel()
+			if err := db.QueryRowContext(qctx, `SELECT COUNT(*) FROM subscriptions WHERE status = 'active'`).Scan(&n); err != nil {
+				log.Printf("metrics: active_subscriptions refresh failed: %v", err)
+				return
+			}
+			metrics.ActiveSubscriptions.Set(float64(n))
+		}
+		refresh() // don't wait 15s for the first value
+		for {
+			select {
+			case <-gaugeCtx.Done():
+				return
+			case <-tick.C:
+				refresh()
+			}
+		}
+	}()
 
 	// Graceful shutdown: run the server in a goroutine, then wait for
 	// SIGINT/SIGTERM in the main goroutine. On signal, tell the server

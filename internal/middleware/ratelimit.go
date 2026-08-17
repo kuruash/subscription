@@ -42,6 +42,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+
+	"subscription-service/internal/metrics"
 )
 
 // Limiter enforces `limit` requests per `window` per client, where
@@ -115,6 +117,11 @@ func (l *Limiter) Handler() gin.HandlerFunc {
 					retryAfterSec = 1
 				}
 			}
+			// Metrics: record the rejection labeled by which limiter
+			// fired ("login" or "sub"). Alerting on
+			// rate(rate_limit_rejections_total{limiter="login"}[5m])
+			// spiking is a good "someone's credential-stuffing us" signal.
+			metrics.RateLimitRejectionsTotal.WithLabelValues(l.name).Inc()
 			c.Header("Retry-After", strconv.FormatInt(retryAfterSec, 10))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": fmt.Sprintf("rate limit exceeded (%d per %s)", l.limit, l.window),

@@ -25,6 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"subscription-service/internal/cache"
+	"subscription-service/internal/metrics"
 	"subscription-service/internal/models"
 	"subscription-service/internal/notifications"
 	"subscription-service/internal/payments"
@@ -163,6 +164,10 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, in SubscribeInput) 
 		log.Printf("Subscribe: DB CreatePending failed after Stripe PI %s created: %v", pi.ID, err)
 		return nil, "", err
 	}
+	// Metrics: a pending sub was successfully created. Doesn't fire on
+	// ErrDuplicateActive (409) — that's an intentionally-rejected retry,
+	// not a business event.
+	metrics.SubscriptionsCreatedTotal.Inc()
 	// Invalidate cache — the new pending row belongs in this user's
 	// list. (ListByUser returns all statuses.)
 	s.invalidateUserList(ctx, created.UserID)
@@ -214,6 +219,11 @@ func (s *SubscriptionService) MarkPaymentFailed(ctx context.Context, paymentInte
 	if err != nil {
 		return nil, err
 	}
+	// Same counter as user-initiated cancel — from a "what state moved"
+	// perspective, this is a subscription moving to cancelled. If ops
+	// ever needs to split them out, add a "reason" label per the note
+	// on SubscriptionsCancelledTotal.
+	metrics.SubscriptionsCancelledTotal.Inc()
 	s.invalidateUserList(ctx, sub.UserID)
 	return sub, nil
 }
@@ -227,6 +237,7 @@ func (s *SubscriptionService) Cancel(ctx context.Context, id int) error {
 	if err != nil {
 		return err
 	}
+	metrics.SubscriptionsCancelledTotal.Inc()
 	s.invalidateUserList(ctx, userID)
 	return nil
 }
@@ -293,17 +304,24 @@ func (s *SubscriptionService) ListByUser(ctx context.Context, userID int) ([]mod
 		jerr := json.Unmarshal(cached, &subs)
 		if jerr == nil {
 			log.Printf("cache HIT %s", key)
+			metrics.CacheHitsTotal.Inc()
 			return subs, nil
 		}
 		// Malformed cache entry — fall through to DB and overwrite it.
+		// Counts as a miss for hit-rate accounting since we're going
+		// to hit Postgres anyway.
 		log.Printf("cache CORRUPT %s: %v (falling back to DB)", key, jerr)
+		metrics.CacheMissesTotal.Inc()
 	} else if !errors.Is(err, redis.Nil) {
 		// Any Redis error other than "key missing" is logged but non-fatal:
 		// the DB is still the source of truth, so we degrade to serving
 		// from Postgres. Redis being down should slow the site, not break it.
+		// Also counts as a miss — we're hitting Postgres regardless of why.
 		log.Printf("cache GET %s failed: %v (falling back to DB)", key, err)
+		metrics.CacheMissesTotal.Inc()
 	} else {
 		log.Printf("cache MISS %s", key)
+		metrics.CacheMissesTotal.Inc()
 	}
 
 	// 2. Cache miss (or Redis error) — fetch from Postgres.
@@ -333,6 +351,12 @@ func (s *SubscriptionService) ExpireOverdue(ctx context.Context) ([]repository.E
 	expired, err := s.repo.ExpireOverdue(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Metrics: one increment per row that actually flipped. Add once
+	// with the batch size instead of Inc()ing in the loop so a big
+	// sweep is a single atomic add on the counter rather than N.
+	if n := len(expired); n > 0 {
+		metrics.SubscriptionsExpiredTotal.Add(float64(n))
 	}
 	// A user with multiple expiring subs shouldn't get multiple DELs of
 	// the same key. Dedupe user_ids first.
