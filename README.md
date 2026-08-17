@@ -41,22 +41,32 @@ middleware.
 
 ```
 subscription-service/
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # Phase 10: build+vet+fmt+unit + integration jobs
 ├── cmd/
 │   ├── api/                  # HTTP server entry point (main.go)
 │   └── worker/               # Background expiration sweeper (main.go)
 ├── internal/
-│   ├── handlers/             # HTTP layer (Gin) — parse, call service, write JSON
+│   ├── handlers/             # HTTP layer (Gin): subscription_handler.go,
+│   │                         #   stripe_webhook_handler.go, auth_handler.go,
+│   │                         #   admin_handler.go — parse, call service, write JSON
 │   ├── services/             # Business logic — validation, orchestration, cache coord.
 │   ├── repository/           # SQL layer — the only place SQL lives
 │   ├── cache/                # Redis key format helpers (shared by API + worker)
 │   ├── notifications/        # In-process event queue + stub consumer
-│   ├── auth/                 # JWT sign/parse helpers
-│   ├── middleware/           # Gin middlewares (RequireAuth)
+│   ├── auth/                 # JWT sign/parse helpers (uid + role claims)
+│   ├── middleware/           # Gin middlewares: auth.go (RequireAuth, WithUserID,
+│   │                         #   WithRole), requireadmin.go (Phase 11 role gate),
+│   │                         #   ratelimit.go (Phase 8), metrics.go (Phase 9 RED)
 │   ├── payments/             # Stripe SDK isolated here — only place that imports stripe-go
+│   ├── metrics/              # Prometheus metric definitions (Phase 9); single
+│   │                         #   source of truth for cardinality policy
 │   └── models/               # Plain data structs shared across layers
 ├── migrations/
 │   ├── 001_init.sql          # Base schema, auto-applied on first Postgres boot
-│   └── 002_add_pending_status.sql   # Phase 7: payment_intent_id, stripe_event_id, widened partial index
+│   ├── 002_add_pending_status.sql   # Phase 7: payment_intent_id, stripe_event_id, widened partial index
+│   └── 003_add_role_and_status_changed_at.sql   # Phase 11: users.role + subscriptions.status_changed_at
 ├── docker-compose.yml        # Postgres + Redis
 ├── go.mod / go.sum
 └── subscription-service-architecture.md
