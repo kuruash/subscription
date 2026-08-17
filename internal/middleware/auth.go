@@ -29,6 +29,16 @@ func UserIDFrom(ctx context.Context) (int, bool) {
 	return v, ok
 }
 
+// WithUserID returns a child context with user_id stashed under the
+// same package-private key RequireAuth uses. Exported so tests can
+// simulate an authenticated request without minting a real JWT, and
+// so any future auth path (mTLS, session cookie) can populate the
+// same key that downstream code (handlers, rate-limiter keyers) reads
+// via UserIDFrom.
+func WithUserID(ctx context.Context, userID int) context.Context {
+	return context.WithValue(ctx, userIDKey, userID)
+}
+
 // RequireAuth verifies a Bearer JWT and stashes the user ID on the
 // request context for handlers to read via UserIDFrom.
 //

@@ -29,7 +29,11 @@ func NewAuthHandler(secret []byte) *AuthHandler {
 	return &AuthHandler{secret: secret}
 }
 
-func (h *AuthHandler) Register(r *gin.Engine) {
+// Register attaches /login onto the given router. Takes gin.IRouter so
+// the caller can pass either the root engine or a group with
+// middleware pre-attached — that's how Phase 8's IP-based rate limiter
+// gets in front of /login without this handler needing to know about it.
+func (h *AuthHandler) Register(r gin.IRouter) {
 	r.POST("/login", h.login)
 }
 

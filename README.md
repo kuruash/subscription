@@ -7,15 +7,16 @@ on a monthly plan, subscriptions expire, get cancelled, or renew.
 Full architecture and rationale live in
 [`subscription-service-architecture.md`](./subscription-service-architecture.md).
 
-**Status: Phase 7 complete** — core CRUD API backed by Postgres, Redis
+**Status: Phase 8 complete** — core CRUD API backed by Postgres, Redis
 cache-aside on the list endpoint, a background worker that expires
 overdue subscriptions, an in-process notification queue, JWT auth on
 all subscription endpoints with per-user ownership checks, an automated
 test suite (service-layer unit tests + repository integration tests
-against real Postgres via testcontainers), and **Stripe sandbox
-payments with idempotent webhook processing** — subscriptions now start
-in `pending` state and flip to `active` only when Stripe confirms the
-PaymentIntent via webhook.
+against real Postgres via testcontainers), Stripe sandbox payments with
+idempotent webhook processing (subscriptions start `pending` and flip
+to `active` only when Stripe confirms), and **Redis-backed rate
+limiting** on `/login` (per-IP) and the protected subscription routes
+(per-authenticated-user), correct across horizontally-scaled instances.
 
 ---
 
@@ -157,16 +158,19 @@ that expire nothing, so it's obvious the process is alive.
 
 All endpoints return JSON. Errors come back as `{"error": "..."}`.
 
-| Method | Path                          | Auth | Description                          |
-|--------|-------------------------------|------|--------------------------------------|
-| POST   | `/login`                      | —    | Issue a JWT for a user_id (stub, see Phase 5) |
-| GET    | `/healthz`                    | —    | Liveness probe                       |
-| POST   | `/webhooks/stripe`            | Stripe signature | Payment lifecycle events (see Phase 7) |
-| POST   | `/subscriptions`              | JWT  | Subscribe — creates pending sub + Stripe PaymentIntent; returns client_secret |
-| GET    | `/subscriptions/:id`          | JWT  | Fetch a single subscription (owner only) |
-| GET    | `/users/:id/subscriptions`    | JWT  | List a user's subscriptions (cached, self only) |
-| DELETE | `/subscriptions/:id`          | JWT  | Cancel (soft delete, owner only)     |
-| POST   | `/subscriptions/:id/renew`    | JWT  | Extend `expires_at` by 30 days (owner only) |
+| Method | Path                          | Auth | Rate limit | Description                          |
+|--------|-------------------------------|------|------------|--------------------------------------|
+| POST   | `/login`                      | —    | 10/min/IP  | Issue a JWT for a user_id (stub, see Phase 5) |
+| GET    | `/healthz`                    | —    | —          | Liveness probe                       |
+| POST   | `/webhooks/stripe`            | Stripe signature | — | Payment lifecycle events (see Phase 7) |
+| POST   | `/subscriptions`              | JWT  | 60/min/user | Subscribe — creates pending sub + Stripe PaymentIntent; returns client_secret |
+| GET    | `/subscriptions/:id`          | JWT  | 60/min/user | Fetch a single subscription (owner only) |
+| GET    | `/users/:id/subscriptions`    | JWT  | 60/min/user | List a user's subscriptions (cached, self only) |
+| DELETE | `/subscriptions/:id`          | JWT  | 60/min/user | Cancel (soft delete, owner only)     |
+| POST   | `/subscriptions/:id/renew`    | JWT  | 60/min/user | Extend `expires_at` by 30 days (owner only) |
+
+Rate limits are per-IP (login) or per-authenticated-user (subscriptions),
+shared across all API instances via Redis (see Phase 8 below).
 
 ### Example: subscribe (Phase 7 flow — pending until paid)
 
@@ -909,6 +913,216 @@ exactly once even though the webhook fired twice.
 
 ---
 
+## Phase 8: Rate Limiting
+
+Two Redis-backed limiters guard the API:
+
+- **`POST /login`** — 10 requests / minute / IP.
+- **Protected subscription routes** — 60 requests / minute / authenticated user.
+
+Both use fixed-window counting: Redis `INCR` on a per-client key,
+`EXPIRE NX` sets the TTL on first hit in the window (idempotent on
+subsequent hits — see `internal/middleware/ratelimit.go` for why
+`ExpireNX` is more crash-safe than "call EXPIRE only when INCR=1").
+Over-limit responses are `429 Too Many Requests` with a `Retry-After`
+header set to the actual remaining TTL of the Redis key.
+
+### Why Redis-backed, not an in-process map
+
+An in-memory counter is per-process. As soon as you run two API
+instances behind a load balancer, each has its own view of "how many
+requests has this client sent" and an attacker sending N per instance
+gets 2N through. Redis is the shared source of truth every instance
+consults — the limit holds without coordination between the API pods.
+
+### Why fixed-window INCR+EXPIRE, not token bucket
+
+INCR is one atomic Redis op; `EXPIRE NX` is a second. Token bucket
+needs refill math (`lastRefill`, `currentTokens`), which is either a
+Lua script for atomicity or several roundtrips with CAS — more code,
+more Redis calls, more ways to be subtly wrong. Fixed-window has a
+well-known boundary-burst weakness (2N in ~2s across the window
+transition) but at our limits that's 20 logins or 120 subscribes in
+~2s worst case — well below anything that hurts Postgres or the JWT
+signer. We upgrade to token bucket the day we care about smoothing
+against a strict downstream cap. Not today.
+
+### Fail open, not closed
+
+If Redis is unreachable, requests are allowed through and the failure
+is logged. Blocking legitimate traffic because our rate-limit counter
+is momentarily unavailable would be worse than a brief un-limited
+window. Same "Redis is optional degradation" philosophy as the Phase
+2 cache-aside layer.
+
+### Middleware ordering (matters — see `cmd/api/main.go`)
+
+```go
+// /login: no auth exists on this route (it's where identity is minted),
+// so IP-based limiting runs standalone. Correct.
+loginGroup := r.Group("", loginLimiter.Handler())
+authH.Register(loginGroup)
+
+// Protected group: RequireAuth MUST run BEFORE the user-based limiter,
+// because SubscriptionsByUser reads user_id from the context that
+// RequireAuth populated. Gin runs middlewares left-to-right, so
+// (RequireAuth, subLimiter) is the correct order. If we reversed
+// them, ByAuthUser would find no user_id, fall through as a no-op
+// (fail-open), and the per-user limit would silently do nothing.
+protected := r.Group("", middleware.RequireAuth(jwtSecret), subLimiter.Handler())
+```
+
+### Why per-IP for /login but per-user for subscriptions
+
+- **/login** has no authenticated identity yet — that's the point of
+  the endpoint. IP is all we have.
+- **Protected routes** have an authenticated user_id from RequireAuth,
+  so we bucket by that. IP-based limiting on protected routes would
+  penalize NAT'd corporate networks where hundreds of legitimate users
+  share one egress IP — one abusive user would starve the rest.
+
+### Why 10/min on /login even though there's no password check yet
+
+`/login` still mints signed JWTs — HMAC-SHA256 has real CPU cost you
+can burn by spamming. Sequential integer user_ids also make it a free
+enumeration oracle. And when Phase 5's password-check gap eventually
+closes, this same 10/min per IP becomes the brute-force ceiling
+automatically — 600 guesses/hour is well below effective
+credential-stuffing rates without a botnet-scale IP pool. Building
+the limit in now means we don't forget to add it when passwords land.
+
+### End-to-end test recipe
+
+Fresh Redis so we start with clean counters:
+
+```bash
+docker exec subs_redis redis-cli --scan --pattern 'ratelimit:*' | xargs -r docker exec -i subs_redis redis-cli DEL
+```
+
+**Trip the /login limit (per-IP):**
+
+```bash
+# Fire 12 login requests as fast as bash can — limit is 10/min.
+# -w prints the status code + Retry-After header per request.
+for i in $(seq 1 12); do
+  curl -s -o /dev/null \
+    -w "req %{http_response_code} retry=%header{retry-after}\n" \
+    -X POST localhost:8080/login \
+    -H 'content-type: application/json' \
+    -d '{"user_id":1}'
+done
+```
+
+Expected output (real curl on macOS supports `%header{name}`;
+Linux may need `%{header_json}` piped through jq if older):
+
+```
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 429 retry=59
+req 429 retry=59
+```
+
+If your curl doesn't support `%header{}`, use `-i` to dump full
+headers:
+
+```bash
+curl -s -i -X POST localhost:8080/login \
+  -H 'content-type: application/json' -d '{"user_id":1}' | head -6
+# HTTP/1.1 429 Too Many Requests
+# Content-Type: application/json; charset=utf-8
+# Retry-After: 58
+# ...
+# {"error":"rate limit exceeded (10 per 1m0s)"}
+```
+
+Inspect the counter directly:
+
+```bash
+docker exec subs_redis redis-cli GET ratelimit:login:ip:::1
+# → "12"    (or however many you fired)
+docker exec subs_redis redis-cli TTL ratelimit:login:ip:::1
+# → 47      (seconds until reset — matches Retry-After header)
+```
+
+The key contains `::1` because on macOS localhost resolves to IPv6.
+On a Linux box or from a real client you'd see `127.0.0.1` or a
+routable IP.
+
+**Trip the subscription limit (per-user):**
+
+Get a token first, then hammer a GET:
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' -d '{"user_id":1}' | jq -r .token)
+
+# Fire 65 GETs — limit is 60/min per user.
+for i in $(seq 1 65); do
+  curl -s -o /dev/null \
+    -w "req %{http_response_code} retry=%header{retry-after}\n" \
+    -H "Authorization: Bearer $TOKEN" \
+    localhost:8080/users/1/subscriptions
+done | tail -10
+```
+
+Expected output (last 10 lines):
+
+```
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 200 retry=
+req 429 retry=54
+req 429 retry=53
+req 429 retry=53
+req 429 retry=53
+```
+
+Inspect:
+
+```bash
+docker exec subs_redis redis-cli GET ratelimit:sub:u:1
+# → "65"
+docker exec subs_redis redis-cli TTL ratelimit:sub:u:1
+# → 47
+
+# A DIFFERENT user is unaffected — separate bucket.
+TOKEN2=$(curl -s -X POST localhost:8080/login \
+  -H 'content-type: application/json' -d '{"user_id":2}' | jq -r .token)
+# Note: for this to actually hit the /login endpoint you'll need to
+# wait for the /login IP limit to reset, or curl from a different IP.
+# In practice for this test you can UPDATE the Redis key to drop it:
+docker exec subs_redis redis-cli DEL ratelimit:login:ip:::1
+```
+
+**Prove the window reset (without waiting a full minute):**
+
+```bash
+# After the first burst above, drop the counter manually and re-fire.
+docker exec subs_redis redis-cli DEL ratelimit:sub:u:1
+curl -s -o /dev/null -w "%{http_response_code}\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  localhost:8080/users/1/subscriptions
+# → 200 (bucket reset)
+```
+
+If you'd rather watch a real window expire, wait ~60s and repeat any
+of the above; the first request after the TTL expires returns 200
+and starts a fresh window.
+
+---
+
 ## What's next
 
 See `subscription-service-architecture.md` §9 for the phase plan.
@@ -919,7 +1133,7 @@ See `subscription-service-architecture.md` §9 for the phase plan.
 - ~~Phase 5 — JWT auth middleware + ownership checks~~ ✅
 - ~~Phase 6 — Automated tests (service unit tests + repository integration tests)~~ ✅
 - ~~Phase 7 — Stripe sandbox payments + webhooks (pending-until-paid, idempotent)~~ ✅
-- Phase 8 — Rate limiting
+- ~~Phase 8 — Rate limiting (Redis-backed fixed-window, per-IP on /login, per-user on protected routes)~~ ✅
 - Phase 9 — Metrics endpoint
 - Phase 10 — GitHub Actions CI/CD
 - Phase 11 — Admin dashboard

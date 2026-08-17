@@ -135,7 +135,31 @@ func main() {
 	r := gin.Default()
 	// Public routes — no auth required.
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
-	authH.Register(r)
+
+	// --- Rate limiters (Phase 8) ---
+	//
+	// Two limiters, different keyer strategies:
+	//   - LoginByIP fronts POST /login. IP-based because there's no
+	//     authenticated identity yet on that route by definition —
+	//     /login is where identity gets minted. 10/min per IP.
+	//   - SubscriptionsByUser guards the protected subscription routes.
+	//     User-based because on the protected group we DO have an
+	//     authenticated user_id (RequireAuth put it on the context),
+	//     and per-user bucketing avoids penalizing NAT'd corporate
+	//     networks where many legit users share one egress IP.
+	//     60/min per authenticated user.
+	//
+	// See internal/middleware/ratelimit.go for the numbers' justification.
+	loginLimiter := middleware.LoginByIP(rdb)
+	subLimiter := middleware.SubscriptionsByUser(rdb)
+
+	// /login goes into a group whose only middleware is the IP limiter.
+	// The route itself is otherwise unauthenticated (Phase 5's password
+	// gap is deliberate). Registering via a group with the middleware
+	// attached is cleaner than mutating the handler to take a middleware
+	// argument — auth handler stays ignorant of rate limiting.
+	loginGroup := r.Group("", loginLimiter.Handler())
+	authH.Register(loginGroup)
 
 	// --- Stripe webhook, PUBLIC (no JWT) ---
 	//
@@ -177,7 +201,15 @@ func main() {
 	// Protected routes — every /subscriptions and /users/:id/subscriptions
 	// path requires a valid JWT. Grouping means adding a new route to the
 	// group inherits the middleware automatically.
-	protected := r.Group("", middleware.RequireAuth(jwtSecret))
+	//
+	// MIDDLEWARE ORDER MATTERS: RequireAuth MUST run before
+	// subLimiter.Handler(). subLimiter uses middleware.ByAuthUser which
+	// reads user_id from the context — the id RequireAuth put there.
+	// If we reversed the order, ByAuthUser would find no user_id, fall
+	// through as a no-op (fail open), and the per-user limit would
+	// silently do nothing. Gin runs middlewares left-to-right, so
+	// (RequireAuth, subLimiter) is the correct order.
+	protected := r.Group("", middleware.RequireAuth(jwtSecret), subLimiter.Handler())
 	subH.Register(protected)
 
 	// Graceful shutdown: run the server in a goroutine, then wait for
