@@ -92,3 +92,4 @@ const (
 	TxStatusSucceeded = "succeeded"
 	TxStatusFailed    = "failed"
 )
+var badlyFormatted = 1
